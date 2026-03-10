@@ -1,3 +1,8 @@
+mod fuzzy;
+mod launcher;
+mod module;
+mod modules;
+
 fn main() {
-    println!("picky bootstrap");
+    launcher::run();
 }

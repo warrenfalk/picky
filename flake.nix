@@ -26,6 +26,18 @@
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          nativeBuildInputs = with pkgs; [
+            makeWrapper
+            pkg-config
+            wrapGAppsHook4
+          ];
+          buildInputs = with pkgs; [
+            gtk4
+          ];
+          postFixup = ''
+            wrapProgram "$out/bin/picky" \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.gtk3 pkgs.niri ]}
+          '';
         };
       in
       {
@@ -44,6 +56,13 @@
             rustToolchain
             rust-analyzer
             pkg-config
+            gtk3
+            gtk4
+            niri
+          ];
+
+          buildInputs = with pkgs; [
+            gtk4
           ];
 
           NIX_SHELL_PRESERVE_PROMPT = "1";
