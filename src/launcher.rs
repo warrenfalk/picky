@@ -114,7 +114,7 @@ fn build_ui(app: &Application) {
     {
         let state = Rc::clone(&state);
         let list_box = list_box.clone();
-        let window = window.clone();
+        let window_for_keys = window.clone();
         let error_label = error_label.clone();
         let key_controller = EventControllerKey::new();
         key_controller.connect_key_pressed(move |_, key, _, _| match key {
@@ -128,17 +128,17 @@ fn build_ui(app: &Application) {
             }
             gdk::Key::Return | gdk::Key::KP_Enter => {
                 if let Some(row) = list_box.selected_row() {
-                    activate_row(&state, row.index(), &window, &error_label);
+                    activate_row(&state, row.index(), &window_for_keys, &error_label);
                 }
                 glib::Propagation::Stop
             }
             gdk::Key::Escape => {
-                window.close();
+                window_for_keys.close();
                 glib::Propagation::Stop
             }
             _ => glib::Propagation::Proceed,
         });
-        search_entry.add_controller(key_controller);
+        window.add_controller(key_controller);
     }
 
     window.present();
@@ -238,7 +238,6 @@ fn move_selection(list_box: &ListBox, offset: i32) {
 
     if let Some(row) = list_box.row_at_index(next_index) {
         list_box.select_row(Some(&row));
-        row.grab_focus();
     }
 }
 
