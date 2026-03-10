@@ -238,8 +238,8 @@ fn build_row(
     content.set_margin_end(8);
 
     let prefix = match kind {
-        Some(MatchKind::Application) => "[app] ",
-        Some(MatchKind::Window) => "[win] ",
+        Some(MatchKind::Application) => "📦 ",
+        Some(MatchKind::Window) => "🪟 ",
         None => "",
     };
 
