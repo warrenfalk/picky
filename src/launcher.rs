@@ -239,6 +239,7 @@ fn build_row(
 
     let prefix = match kind {
         Some(MatchKind::Application) => "📦 ",
+        Some(MatchKind::BrowserTab) => "🌐 ",
         Some(MatchKind::Window) => "🪟 ",
         None => "",
     };

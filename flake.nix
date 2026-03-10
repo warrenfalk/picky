@@ -36,7 +36,7 @@
           ];
           postFixup = ''
             wrapProgram "$out/bin/picky" \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.gtk3 pkgs.niri ]}
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.firefox pkgs.gtk3 pkgs.niri ]}
           '';
         };
       in
@@ -53,6 +53,7 @@
           name = "picky";
 
           packages = with pkgs; [
+            firefox
             rustToolchain
             rust-analyzer
             pkg-config
