@@ -31,7 +31,7 @@ fn build_ui(app: &Application) {
         .application(app)
         .title("picky")
         .default_width(820)
-        .default_height(520)
+        .default_height(680)
         .decorated(false)
         .resizable(false)
         .build();
