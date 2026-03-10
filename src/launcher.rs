@@ -13,6 +13,9 @@ use gtk4 as gtk;
 use crate::module::{MatchKind, ModuleRegistry, SearchResult};
 use crate::modules;
 
+const WINDOW_WIDTH: i32 = 820;
+const WINDOW_HEIGHT_FRACTION: f64 = 0.7;
+
 pub fn run() {
     let app = Application::builder()
         .application_id("com.warren.picky")
@@ -30,7 +33,7 @@ fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("picky")
-        .default_width(820)
+        .default_width(WINDOW_WIDTH)
         .default_height(680)
         .decorated(false)
         .resizable(false)
@@ -154,7 +157,25 @@ fn build_ui(app: &Application) {
     }
 
     window.present();
+    glib::idle_add_local_once({
+        let window = window.clone();
+        move || resize_window_for_monitor(&window)
+    });
     search_entry.grab_focus();
+}
+
+fn resize_window_for_monitor(window: &ApplicationWindow) {
+    let Some(surface) = window.surface() else {
+        return;
+    };
+    let display = surface.display();
+    let Some(monitor) = display.monitor_at_surface(&surface) else {
+        return;
+    };
+
+    let target_height =
+        ((monitor.geometry().height() as f64) * WINDOW_HEIGHT_FRACTION).round() as i32;
+    window.set_default_size(WINDOW_WIDTH, target_height.max(360));
 }
 
 fn refresh_results(
