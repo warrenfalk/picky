@@ -114,6 +114,18 @@ fn build_ui(app: &Application) {
     {
         let state = Rc::clone(&state);
         let list_box = list_box.clone();
+        let window = window.clone();
+        let error_label = error_label.clone();
+        search_entry.connect_activate(move |_| {
+            if let Some(row) = list_box.selected_row() {
+                activate_row(&state, row.index(), &window, &error_label);
+            }
+        });
+    }
+
+    {
+        let state = Rc::clone(&state);
+        let list_box = list_box.clone();
         let window_for_keys = window.clone();
         let error_label = error_label.clone();
         let key_controller = EventControllerKey::new();
