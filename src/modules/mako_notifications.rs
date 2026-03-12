@@ -5,7 +5,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::fuzzy;
-use crate::module::{DEFAULT_ACTION_ID, MatchKind, Module, ResultAction, SearchResult};
+use crate::module::{
+    ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, ResultAction, SearchResult,
+};
 
 const MODULE_KEY: &str = "mako-notifications";
 const EMPTY_QUERY_BASE_SCORE: i64 = 10_000;
@@ -97,7 +99,7 @@ impl Module for MakoNotificationsModule {
         Ok(results)
     }
 
-    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<()> {
+    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome> {
         match action_id {
             DEFAULT_ACTION_ID => {
                 let invoke_status = Command::new("makoctl")
@@ -110,14 +112,19 @@ impl Module for MakoNotificationsModule {
 
                 if invoke_status.success() {
                     dismiss_notification(item_id)?;
-                    return Ok(());
+                    return Ok(ActivationOutcome::ClosePicker);
                 }
 
                 dismiss_notification(item_id).map_err(|_| {
                     anyhow::anyhow!("mako refused to invoke or dismiss notification {item_id}")
-                })
+                })?;
+
+                Ok(ActivationOutcome::ClosePicker)
             }
-            DISMISS_ACTION_ID => dismiss_notification(item_id),
+            DISMISS_ACTION_ID => {
+                dismiss_notification(item_id)?;
+                Ok(ActivationOutcome::RefreshResults)
+            }
             _ => bail!("unknown notification action: {action_id}"),
         }
     }

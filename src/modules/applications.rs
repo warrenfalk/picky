@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 
 use crate::fuzzy;
-use crate::module::{DEFAULT_ACTION_ID, MatchKind, Module, SearchResult};
+use crate::module::{ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, SearchResult};
 
 const MODULE_KEY: &str = "applications";
 
@@ -84,7 +84,7 @@ impl Module for ApplicationsModule {
         Ok(results)
     }
 
-    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<()> {
+    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome> {
         if action_id != DEFAULT_ACTION_ID {
             anyhow::bail!("unknown application action: {action_id}");
         }
@@ -97,7 +97,7 @@ impl Module for ApplicationsModule {
             .spawn()
             .with_context(|| format!("failed to launch desktop entry {item_id}"))?;
 
-        Ok(())
+        Ok(ActivationOutcome::ClosePicker)
     }
 }
 

@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::fuzzy;
-use crate::module::{DEFAULT_ACTION_ID, MatchKind, Module, SearchResult};
+use crate::module::{ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, SearchResult};
 
 const MODULE_KEY: &str = "niri-windows";
 
@@ -75,7 +75,7 @@ impl Module for NiriWindowsModule {
         Ok(results)
     }
 
-    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<()> {
+    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome> {
         if action_id != DEFAULT_ACTION_ID {
             anyhow::bail!("unknown window action: {action_id}");
         }
@@ -92,7 +92,7 @@ impl Module for NiriWindowsModule {
             bail!("niri refused to focus window {item_id}");
         }
 
-        Ok(())
+        Ok(ActivationOutcome::ClosePicker)
     }
 }
 

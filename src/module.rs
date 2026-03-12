@@ -2,6 +2,12 @@ use anyhow::{Result, anyhow};
 
 pub const DEFAULT_ACTION_ID: &str = "default";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivationOutcome {
+    ClosePicker,
+    RefreshResults,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MatchKind {
     Application,
@@ -32,7 +38,7 @@ pub struct SearchResult {
 pub trait Module {
     fn key(&self) -> &'static str;
     fn search(&mut self, query: &str) -> Result<Vec<SearchResult>>;
-    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<()>;
+    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome>;
 }
 
 pub struct ModuleRegistry {
@@ -63,11 +69,15 @@ impl ModuleRegistry {
         Ok(results)
     }
 
-    pub fn activate(&mut self, result: &SearchResult) -> Result<()> {
+    pub fn activate(&mut self, result: &SearchResult) -> Result<ActivationOutcome> {
         self.activate_action(result, DEFAULT_ACTION_ID)
     }
 
-    pub fn activate_action(&mut self, result: &SearchResult, action_id: &str) -> Result<()> {
+    pub fn activate_action(
+        &mut self,
+        result: &SearchResult,
+        action_id: &str,
+    ) -> Result<ActivationOutcome> {
         let module = self
             .modules
             .iter_mut()

@@ -11,7 +11,7 @@ use gtk::{
 };
 use gtk4 as gtk;
 
-use crate::module::{MatchKind, ModuleRegistry, SearchResult};
+use crate::module::{ActivationOutcome, MatchKind, ModuleRegistry, SearchResult};
 use crate::modules;
 
 const WINDOW_WIDTH: i32 = 820;
@@ -115,9 +115,21 @@ fn build_ui(app: &Application) {
     {
         let state = Rc::clone(&state);
         let window = window.clone();
+        let list_box = list_box.clone();
+        let list_box_for_action = list_box.clone();
+        let search_entry = search_entry.clone();
+        let results_label = results_label.clone();
         let error_label = error_label.clone();
         list_box.connect_row_activated(move |_, row| {
-            activate_row(&state, row.index(), &window, &error_label);
+            activate_row(
+                &state,
+                row.index(),
+                &window,
+                &search_entry,
+                &list_box_for_action,
+                &results_label,
+                &error_label,
+            );
         });
     }
 
@@ -125,10 +137,21 @@ fn build_ui(app: &Application) {
         let state = Rc::clone(&state);
         let list_box = list_box.clone();
         let window = window.clone();
+        let search_entry_for_action = search_entry.clone();
+        let list_box_for_action = list_box.clone();
+        let results_label = results_label.clone();
         let error_label = error_label.clone();
         search_entry.connect_activate(move |_| {
             if let Some(row) = list_box.selected_row() {
-                activate_row(&state, row.index(), &window, &error_label);
+                activate_row(
+                    &state,
+                    row.index(),
+                    &window,
+                    &search_entry_for_action,
+                    &list_box_for_action,
+                    &results_label,
+                    &error_label,
+                );
             }
         });
     }
@@ -152,6 +175,9 @@ fn build_ui(app: &Application) {
         let list_box = list_box.clone();
         let list_box_for_keys = list_box.clone();
         let search_entry = search_entry.clone();
+        let search_entry_for_actions = search_entry.clone();
+        let list_box_for_actions = list_box.clone();
+        let results_label = results_label.clone();
         let window_for_keys = window.clone();
         let error_label = error_label.clone();
         let key_controller = EventControllerKey::new();
@@ -170,7 +196,15 @@ fn build_ui(app: &Application) {
             }
             gdk::Key::Return | gdk::Key::KP_Enter => {
                 if let Some(row) = list_box_for_keys.selected_row() {
-                    activate_row(&state, row.index(), &window_for_keys, &error_label);
+                    activate_row(
+                        &state,
+                        row.index(),
+                        &window_for_keys,
+                        &search_entry,
+                        &list_box_for_keys,
+                        &results_label,
+                        &error_label,
+                    );
                 }
                 glib::Propagation::Stop
             }
@@ -184,6 +218,9 @@ fn build_ui(app: &Application) {
                             row.index(),
                             action_id,
                             &window_for_keys,
+                            &search_entry_for_actions,
+                            &list_box_for_actions,
+                            &results_label,
                             &error_label,
                         );
                     }
@@ -376,14 +413,30 @@ fn activate_row(
     state: &Rc<RefCell<UiState>>,
     row_index: i32,
     window: &ApplicationWindow,
+    search_entry: &Entry,
+    list_box: &ListBox,
+    results_label: &Label,
     error_label: &Label,
 ) {
     let Some(result) = state.borrow().results.get(row_index as usize).cloned() else {
         return;
     };
 
-    match state.borrow_mut().registry.activate(&result) {
-        Ok(()) => window.close(),
+    let activation = {
+        let mut state = state.borrow_mut();
+        state.registry.activate(&result)
+    };
+
+    match activation {
+        Ok(outcome) => handle_activation_outcome(
+            outcome,
+            state,
+            window,
+            search_entry,
+            list_box,
+            results_label,
+            error_label,
+        ),
         Err(err) => error_label.set_text(&err.to_string()),
     }
 }
@@ -393,14 +446,61 @@ fn activate_row_action(
     row_index: i32,
     action_id: &str,
     window: &ApplicationWindow,
+    search_entry: &Entry,
+    list_box: &ListBox,
+    results_label: &Label,
     error_label: &Label,
 ) {
     let Some(result) = state.borrow().results.get(row_index as usize).cloned() else {
         return;
     };
 
-    match state.borrow_mut().registry.activate_action(&result, action_id) {
-        Ok(()) => window.close(),
+    let activation = {
+        let mut state = state.borrow_mut();
+        state.registry.activate_action(&result, action_id)
+    };
+
+    match activation {
+        Ok(outcome) => handle_activation_outcome(
+            outcome,
+            state,
+            window,
+            search_entry,
+            list_box,
+            results_label,
+            error_label,
+        ),
         Err(err) => error_label.set_text(&err.to_string()),
+    }
+}
+
+fn handle_activation_outcome(
+    outcome: ActivationOutcome,
+    state: &Rc<RefCell<UiState>>,
+    window: &ApplicationWindow,
+    search_entry: &Entry,
+    list_box: &ListBox,
+    results_label: &Label,
+    error_label: &Label,
+) {
+    match outcome {
+        ActivationOutcome::ClosePicker => window.close(),
+        ActivationOutcome::RefreshResults => {
+            let should_focus_results = !search_entry.has_focus();
+            refresh_results(
+                state,
+                search_entry.text().as_ref(),
+                list_box,
+                results_label,
+                error_label,
+            );
+            error_label.set_text("");
+
+            if should_focus_results {
+                focus_results_list(list_box);
+            } else {
+                search_entry.grab_focus();
+            }
+        }
     }
 }
