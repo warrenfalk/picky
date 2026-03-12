@@ -3,6 +3,7 @@ use anyhow::{Result, anyhow};
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MatchKind {
     Application,
+    Notification,
     Window,
 }
 

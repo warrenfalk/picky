@@ -51,7 +51,7 @@ fn build_ui(app: &Application) {
     title.add_css_class("title-2");
     title.set_halign(gtk::Align::Center);
 
-    let subtitle = Label::new(Some("Search applications and Niri windows"));
+    let subtitle = Label::new(Some("Search notifications, applications, and Niri windows"));
     subtitle.add_css_class("dim-label");
     subtitle.set_halign(gtk::Align::Center);
 
@@ -246,6 +246,7 @@ fn build_row(
 
     let prefix = match kind {
         Some(MatchKind::Application) => "📦 ",
+        Some(MatchKind::Notification) => "🔔 ",
         Some(MatchKind::Window) => "🪟 ",
         None => "",
     };
