@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use gtk::gdk;
 use gtk::glib;
+use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Entry, EventControllerKey, Label, ListBox,
@@ -15,6 +16,7 @@ use crate::modules;
 
 const WINDOW_WIDTH: i32 = 820;
 const WINDOW_HEIGHT_FRACTION: f64 = 0.7;
+const WINDOW_CONTENT_WIDTH: i32 = WINDOW_WIDTH - 36;
 
 pub fn run() {
     let app = Application::builder()
@@ -63,12 +65,16 @@ fn build_ui(app: &Application) {
     let list_box = ListBox::new();
     list_box.set_selection_mode(SelectionMode::Single);
     list_box.add_css_class("boxed-list");
+    list_box.set_hexpand(true);
 
     let scroller = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vexpand(true)
         .child(&list_box)
         .build();
+    scroller.set_min_content_width(WINDOW_CONTENT_WIDTH);
+    scroller.set_max_content_width(WINDOW_CONTENT_WIDTH);
+    scroller.set_propagate_natural_width(false);
 
     let error_label = Label::new(None);
     error_label.set_halign(gtk::Align::Start);
@@ -236,6 +242,7 @@ fn build_row(
     content.set_margin_bottom(8);
     content.set_margin_start(8);
     content.set_margin_end(8);
+    content.set_hexpand(true);
 
     let prefix = match kind {
         Some(MatchKind::Application) => "📦 ",
@@ -252,10 +259,16 @@ fn build_row(
     let title_label = Label::new(Some(&title_text));
     title_label.set_halign(gtk::Align::Start);
     title_label.set_xalign(0.0);
+    title_label.set_hexpand(true);
+    title_label.set_ellipsize(EllipsizeMode::End);
+    title_label.set_single_line_mode(true);
 
     let subtitle_label = Label::new(Some(subtitle));
     subtitle_label.set_halign(gtk::Align::Start);
     subtitle_label.set_xalign(0.0);
+    subtitle_label.set_hexpand(true);
+    subtitle_label.set_ellipsize(EllipsizeMode::End);
+    subtitle_label.set_single_line_mode(true);
     subtitle_label.add_css_class("dim-label");
 
     content.append(&title_label);
