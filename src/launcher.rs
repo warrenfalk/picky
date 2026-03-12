@@ -66,6 +66,7 @@ fn build_ui(app: &Application) {
     list_box.set_selection_mode(SelectionMode::Single);
     list_box.add_css_class("boxed-list");
     list_box.set_hexpand(true);
+    list_box.set_focusable(true);
 
     let scroller = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
@@ -133,31 +134,78 @@ fn build_ui(app: &Application) {
     }
 
     {
+        let list_box = list_box.clone();
+        let key_controller = EventControllerKey::new();
+        key_controller.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Down {
+                focus_results_list(&list_box);
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        search_entry.add_controller(key_controller);
+    }
+
+    {
         let state = Rc::clone(&state);
         let list_box = list_box.clone();
+        let list_box_for_keys = list_box.clone();
+        let search_entry = search_entry.clone();
         let window_for_keys = window.clone();
         let error_label = error_label.clone();
         let key_controller = EventControllerKey::new();
         key_controller.connect_key_pressed(move |_, key, _, _| match key {
             gdk::Key::Down => {
-                move_selection(&list_box, 1);
+                move_selection(&list_box_for_keys, 1);
                 glib::Propagation::Stop
             }
             gdk::Key::Up => {
-                move_selection(&list_box, -1);
+                if selected_row_index(&list_box_for_keys).unwrap_or(0) == 0 {
+                    search_entry.grab_focus();
+                } else {
+                    move_selection(&list_box_for_keys, -1);
+                }
                 glib::Propagation::Stop
             }
             gdk::Key::Return | gdk::Key::KP_Enter => {
-                if let Some(row) = list_box.selected_row() {
+                if let Some(row) = list_box_for_keys.selected_row() {
                     activate_row(&state, row.index(), &window_for_keys, &error_label);
                 }
                 glib::Propagation::Stop
             }
-            gdk::Key::Escape => {
+            _ => {
+                if let Some(action_id) =
+                    selected_action_id_for_shortcut(&state, &list_box_for_keys, key)
+                {
+                    if let Some(row) = list_box_for_keys.selected_row() {
+                        activate_row_action(
+                            &state,
+                            row.index(),
+                            action_id,
+                            &window_for_keys,
+                            &error_label,
+                        );
+                    }
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        });
+        list_box.add_controller(key_controller);
+    }
+
+    {
+        let window_for_keys = window.clone();
+        let key_controller = EventControllerKey::new();
+        key_controller.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
                 window_for_keys.close();
                 glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
             }
-            _ => glib::Propagation::Proceed,
         });
         window.add_controller(key_controller);
     }
@@ -288,6 +336,42 @@ fn move_selection(list_box: &ListBox, offset: i32) {
     }
 }
 
+fn focus_results_list(list_box: &ListBox) {
+    if list_box.selected_row().is_none() {
+        if let Some(row) = list_box.row_at_index(0) {
+            list_box.select_row(Some(&row));
+        }
+    }
+
+    if let Some(row) = list_box.selected_row() {
+        row.grab_focus();
+    } else {
+        list_box.grab_focus();
+    }
+}
+
+fn selected_row_index(list_box: &ListBox) -> Option<i32> {
+    list_box.selected_row().map(|row| row.index())
+}
+
+fn selected_action_id_for_shortcut(
+    state: &Rc<RefCell<UiState>>,
+    list_box: &ListBox,
+    key: gdk::Key,
+) -> Option<&'static str> {
+    let shortcut = key.to_unicode()?.to_ascii_lowercase();
+    let row_index = selected_row_index(list_box)? as usize;
+
+    state
+        .borrow()
+        .results
+        .get(row_index)?
+        .actions
+        .iter()
+        .find(|action| action.shortcut.to_ascii_lowercase() == shortcut)
+        .map(|action| action.id)
+}
+
 fn activate_row(
     state: &Rc<RefCell<UiState>>,
     row_index: i32,
@@ -299,6 +383,23 @@ fn activate_row(
     };
 
     match state.borrow_mut().registry.activate(&result) {
+        Ok(()) => window.close(),
+        Err(err) => error_label.set_text(&err.to_string()),
+    }
+}
+
+fn activate_row_action(
+    state: &Rc<RefCell<UiState>>,
+    row_index: i32,
+    action_id: &str,
+    window: &ApplicationWindow,
+    error_label: &Label,
+) {
+    let Some(result) = state.borrow().results.get(row_index as usize).cloned() else {
+        return;
+    };
+
+    match state.borrow_mut().registry.activate_action(&result, action_id) {
         Ok(()) => window.close(),
         Err(err) => error_label.set_text(&err.to_string()),
     }

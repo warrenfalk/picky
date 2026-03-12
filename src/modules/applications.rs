@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 
 use crate::fuzzy;
-use crate::module::{MatchKind, Module, SearchResult};
+use crate::module::{DEFAULT_ACTION_ID, MatchKind, Module, SearchResult};
 
 const MODULE_KEY: &str = "applications";
 
@@ -68,6 +68,7 @@ impl Module for ApplicationsModule {
                     },
                     icon_name: entry.icon_name.clone(),
                     kind: MatchKind::Application,
+                    actions: Vec::new(),
                     score,
                 })
             })
@@ -83,7 +84,11 @@ impl Module for ApplicationsModule {
         Ok(results)
     }
 
-    fn activate(&mut self, item_id: &str) -> Result<()> {
+    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<()> {
+        if action_id != DEFAULT_ACTION_ID {
+            anyhow::bail!("unknown application action: {action_id}");
+        }
+
         Command::new("gtk-launch")
             .arg(item_id)
             .stdin(Stdio::null())

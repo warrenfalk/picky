@@ -5,10 +5,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::fuzzy;
-use crate::module::{MatchKind, Module, SearchResult};
+use crate::module::{DEFAULT_ACTION_ID, MatchKind, Module, ResultAction, SearchResult};
 
 const MODULE_KEY: &str = "mako-notifications";
 const EMPTY_QUERY_BASE_SCORE: i64 = 10_000;
+const DISMISS_ACTION_ID: &str = "dismiss";
 
 pub struct MakoNotificationsModule;
 
@@ -76,6 +77,11 @@ impl Module for MakoNotificationsModule {
                     subtitle,
                     icon_name: None,
                     kind: MatchKind::Notification,
+                    actions: vec![ResultAction {
+                        id: DISMISS_ACTION_ID,
+                        label: "Dismiss",
+                        shortcut: 'd',
+                    }],
                     score,
                 })
             })
@@ -91,22 +97,29 @@ impl Module for MakoNotificationsModule {
         Ok(results)
     }
 
-    fn activate(&mut self, item_id: &str) -> Result<()> {
-        let invoke_status = Command::new("makoctl")
-            .args(["invoke", "-n", item_id])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .with_context(|| format!("failed to invoke notification {item_id}"))?;
+    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<()> {
+        match action_id {
+            DEFAULT_ACTION_ID => {
+                let invoke_status = Command::new("makoctl")
+                    .args(["invoke", "-n", item_id])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .with_context(|| format!("failed to invoke notification {item_id}"))?;
 
-        if invoke_status.success() {
-            dismiss_notification(item_id)?;
-            return Ok(());
+                if invoke_status.success() {
+                    dismiss_notification(item_id)?;
+                    return Ok(());
+                }
+
+                dismiss_notification(item_id).map_err(|_| {
+                    anyhow::anyhow!("mako refused to invoke or dismiss notification {item_id}")
+                })
+            }
+            DISMISS_ACTION_ID => dismiss_notification(item_id),
+            _ => bail!("unknown notification action: {action_id}"),
         }
-
-        dismiss_notification(item_id)
-            .map_err(|_| anyhow::anyhow!("mako refused to invoke or dismiss notification {item_id}"))
     }
 }
 

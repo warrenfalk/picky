@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::fuzzy;
-use crate::module::{MatchKind, Module, SearchResult};
+use crate::module::{DEFAULT_ACTION_ID, MatchKind, Module, SearchResult};
 
 const MODULE_KEY: &str = "niri-windows";
 
@@ -59,6 +59,7 @@ impl Module for NiriWindowsModule {
                     subtitle,
                     icon_name: None,
                     kind: MatchKind::Window,
+                    actions: Vec::new(),
                     score,
                 })
             })
@@ -74,7 +75,11 @@ impl Module for NiriWindowsModule {
         Ok(results)
     }
 
-    fn activate(&mut self, item_id: &str) -> Result<()> {
+    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<()> {
+        if action_id != DEFAULT_ACTION_ID {
+            anyhow::bail!("unknown window action: {action_id}");
+        }
+
         let status = Command::new("niri")
             .args(["msg", "action", "focus-window", "--id", item_id])
             .stdin(Stdio::null())

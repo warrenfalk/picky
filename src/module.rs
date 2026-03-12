@@ -1,10 +1,20 @@
 use anyhow::{Result, anyhow};
 
+pub const DEFAULT_ACTION_ID: &str = "default";
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MatchKind {
     Application,
     Notification,
     Window,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResultAction {
+    pub id: &'static str,
+    #[allow(dead_code)]
+    pub label: &'static str,
+    pub shortcut: char,
 }
 
 #[derive(Clone, Debug)]
@@ -15,13 +25,14 @@ pub struct SearchResult {
     pub subtitle: String,
     pub icon_name: Option<String>,
     pub kind: MatchKind,
+    pub actions: Vec<ResultAction>,
     pub score: i64,
 }
 
 pub trait Module {
     fn key(&self) -> &'static str;
     fn search(&mut self, query: &str) -> Result<Vec<SearchResult>>;
-    fn activate(&mut self, item_id: &str) -> Result<()>;
+    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<()>;
 }
 
 pub struct ModuleRegistry {
@@ -53,12 +64,16 @@ impl ModuleRegistry {
     }
 
     pub fn activate(&mut self, result: &SearchResult) -> Result<()> {
+        self.activate_action(result, DEFAULT_ACTION_ID)
+    }
+
+    pub fn activate_action(&mut self, result: &SearchResult, action_id: &str) -> Result<()> {
         let module = self
             .modules
             .iter_mut()
             .find(|module| module.key() == result.module_key)
             .ok_or_else(|| anyhow!("Unknown module: {}", result.module_key))?;
 
-        module.activate(&result.item_id)
+        module.activate(&result.item_id, action_id)
     }
 }
