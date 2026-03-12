@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 
 use gtk::gdk;
@@ -6,8 +7,8 @@ use gtk::glib;
 use gtk::pango::EllipsizeMode;
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, Entry, EventControllerKey, Label, ListBox,
-    ListBoxRow, Orientation, PolicyType, ScrolledWindow, SelectionMode,
+    Application, ApplicationWindow, Box as GtkBox, Entry, EventControllerKey, Image, Label,
+    ListBox, ListBoxRow, Orientation, PolicyType, ScrolledWindow, SelectionMode,
 };
 use gtk4 as gtk;
 
@@ -17,6 +18,7 @@ use crate::modules;
 const WINDOW_WIDTH: i32 = 820;
 const WINDOW_HEIGHT_FRACTION: f64 = 0.7;
 const WINDOW_CONTENT_WIDTH: i32 = WINDOW_WIDTH - 36;
+const RESULT_ICON_SIZE: i32 = 28;
 
 pub fn run() {
     let app = Application::builder()
@@ -322,24 +324,26 @@ fn build_row(
     icon_name: Option<&str>,
 ) -> ListBoxRow {
     let row = ListBoxRow::new();
-    let content = GtkBox::new(Orientation::Vertical, 4);
+    let content = GtkBox::new(Orientation::Horizontal, 10);
     content.set_margin_top(8);
     content.set_margin_bottom(8);
     content.set_margin_start(8);
     content.set_margin_end(8);
     content.set_hexpand(true);
 
+    let icon = build_result_icon(kind, icon_name);
+    let text_content = GtkBox::new(Orientation::Vertical, 4);
+    text_content.set_hexpand(true);
+
     let prefix = match kind {
-        Some(MatchKind::Application) => "📦 ",
+        Some(MatchKind::Application) if icon.is_none() => "📦 ",
+        Some(MatchKind::Application) => "",
         Some(MatchKind::Notification) => "🔔 ",
         Some(MatchKind::Window) => "🪟 ",
         None => "",
     };
 
-    let title_text = match icon_name {
-        Some(icon_name) if !icon_name.is_empty() => format!("{prefix}{title}  ({icon_name})"),
-        _ => format!("{prefix}{title}"),
-    };
+    let title_text = format!("{prefix}{title}");
 
     let title_label = Label::new(Some(&title_text));
     title_label.set_halign(gtk::Align::Start);
@@ -356,12 +360,46 @@ fn build_row(
     subtitle_label.set_single_line_mode(true);
     subtitle_label.add_css_class("dim-label");
 
-    content.append(&title_label);
-    if !subtitle.is_empty() {
-        content.append(&subtitle_label);
+    if let Some(icon) = icon {
+        content.append(&icon);
     }
+
+    text_content.append(&title_label);
+    if !subtitle.is_empty() {
+        text_content.append(&subtitle_label);
+    }
+    content.append(&text_content);
     row.set_child(Some(&content));
     row
+}
+
+fn build_result_icon(kind: Option<MatchKind>, icon_name: Option<&str>) -> Option<Image> {
+    match kind {
+        Some(MatchKind::Application) => build_application_icon(icon_name),
+        _ => None,
+    }
+}
+
+fn build_application_icon(icon_name: Option<&str>) -> Option<Image> {
+    let icon_name = icon_name?.trim();
+    if icon_name.is_empty() {
+        return None;
+    }
+
+    let image = if Path::new(icon_name).is_absolute() && Path::new(icon_name).is_file() {
+        Image::from_file(icon_name)
+    } else {
+        let display = gdk::Display::default()?;
+        let icon_theme = gtk::IconTheme::for_display(&display);
+        if !icon_theme.has_icon(icon_name) {
+            return None;
+        }
+        Image::from_icon_name(icon_name)
+    };
+
+    image.set_pixel_size(RESULT_ICON_SIZE);
+    image.set_valign(gtk::Align::Start);
+    Some(image)
 }
 
 fn move_selection(list_box: &ListBox, offset: i32) {
