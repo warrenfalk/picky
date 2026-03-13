@@ -21,7 +21,14 @@ struct NiriWindow {
     #[serde(default)]
     app_id: String,
     workspace_id: u64,
-    is_focused: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct NiriWorkspace {
+    id: u64,
+    idx: u64,
+    name: Option<String>,
+    output: String,
 }
 
 impl NiriWindowsModule {
@@ -43,21 +50,39 @@ impl Module for NiriWindowsModule {
     fn search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
         let query = query.trim();
         let windows = load_windows()?;
+        let workspaces = load_workspaces()?
+            .into_iter()
+            .map(|workspace| (workspace.id, workspace))
+            .collect::<HashMap<_, _>>();
 
         let mut results = windows
             .into_iter()
             .filter_map(|window| {
-                let workspace = window.workspace_id.to_string();
-                let base_score = if window.is_focused { 5 } else { 0 };
+                let workspace = workspaces.get(&window.workspace_id);
+                let workspace_label = workspace
+                    .and_then(|workspace| workspace.name.clone())
+                    .unwrap_or_else(|| {
+                        workspace
+                            .map(|workspace| workspace.idx.to_string())
+                            .unwrap_or_else(|| window.workspace_id.to_string())
+                    });
+                let output_name = workspace
+                    .map(|workspace| workspace.output.as_str())
+                    .unwrap_or("unknown output");
                 let score = fuzzy::score_fields(
                     query,
-                    &[(&window.title, 120), (&window.app_id, 70), (&workspace, 20)],
-                )? + base_score;
+                    &[
+                        (&window.title, 120),
+                        (&window.app_id, 70),
+                        (&workspace_label, 30),
+                        (output_name, 20),
+                    ],
+                )?;
 
                 let subtitle = if window.app_id.is_empty() {
-                    format!("workspace {}", window.workspace_id)
+                    format!("{workspace_label} on {output_name}")
                 } else {
-                    format!("{}  workspace {}", window.app_id, window.workspace_id)
+                    format!("{}  {} on {}", window.app_id, workspace_label, output_name)
                 };
 
                 Some(SearchResult {
@@ -118,6 +143,22 @@ fn load_windows() -> Result<Vec<NiriWindow>> {
     }
 
     serde_json::from_slice(&output.stdout).context("failed to parse niri windows JSON")
+}
+
+fn load_workspaces() -> Result<Vec<NiriWorkspace>> {
+    let output = Command::new("niri")
+        .args(["msg", "--json", "workspaces"])
+        .output()
+        .context("failed to run `niri msg --json workspaces`")?;
+
+    if !output.status.success() {
+        bail!(
+            "`niri msg --json workspaces` failed with status {}",
+            output.status
+        );
+    }
+
+    serde_json::from_slice(&output.stdout).context("failed to parse niri workspaces JSON")
 }
 
 fn icon_name_for_app_id(icon_index: &HashMap<String, String>, app_id: &str) -> Option<String> {
