@@ -19,6 +19,7 @@ const WINDOW_WIDTH: i32 = 820;
 const WINDOW_HEIGHT_FRACTION: f64 = 0.7;
 const WINDOW_CONTENT_WIDTH: i32 = WINDOW_WIDTH - 36;
 const RESULT_ICON_SIZE: i32 = 28;
+const SUBTITLE_ICON_SIZE: i32 = 22;
 
 pub fn run() {
     let app = Application::builder()
@@ -331,15 +332,16 @@ fn build_row(
     content.set_margin_end(8);
     content.set_hexpand(true);
 
-    let icon = build_result_icon(kind, icon_name);
+    let leading_widget = build_leading_widget(kind, icon_name);
     let text_content = GtkBox::new(Orientation::Vertical, 4);
     text_content.set_hexpand(true);
 
     let prefix = match kind {
-        Some(MatchKind::Application) if icon.is_none() => "📦 ",
+        Some(MatchKind::Application) if leading_widget.is_none() => "📦 ",
         Some(MatchKind::Application) => "",
-        Some(MatchKind::Notification) => "🔔 ",
-        Some(MatchKind::Window) => "🪟 ",
+        Some(MatchKind::Notification) if leading_widget.is_none() => "🔔 ",
+        Some(MatchKind::Notification) => "",
+        Some(MatchKind::Window) => "",
         None => "",
     };
 
@@ -360,27 +362,45 @@ fn build_row(
     subtitle_label.set_single_line_mode(true);
     subtitle_label.add_css_class("dim-label");
 
-    if let Some(icon) = icon {
-        content.append(&icon);
+    if let Some(leading_widget) = leading_widget {
+        content.append(&leading_widget);
     }
 
     text_content.append(&title_label);
     if !subtitle.is_empty() {
-        text_content.append(&subtitle_label);
+        if let Some(subtitle_prefix) = build_subtitle_prefix(kind, icon_name) {
+            let subtitle_row = GtkBox::new(Orientation::Horizontal, 6);
+            subtitle_row.set_hexpand(true);
+            subtitle_row.append(&subtitle_prefix);
+            subtitle_row.append(&subtitle_label);
+            text_content.append(&subtitle_row);
+        } else {
+            text_content.append(&subtitle_label);
+        }
     }
     content.append(&text_content);
     row.set_child(Some(&content));
     row
 }
 
-fn build_result_icon(kind: Option<MatchKind>, icon_name: Option<&str>) -> Option<Image> {
+fn build_leading_widget(kind: Option<MatchKind>, icon_name: Option<&str>) -> Option<gtk::Widget> {
     match kind {
-        Some(MatchKind::Application) => build_application_icon(icon_name),
+        Some(MatchKind::Application) => build_application_icon(icon_name, RESULT_ICON_SIZE)
+            .map(|image| image.upcast::<gtk::Widget>()),
+        Some(MatchKind::Window) => Some(build_symbol_label("🗖").upcast::<gtk::Widget>()),
+        Some(MatchKind::Notification) => Some(build_symbol_label("🔔").upcast::<gtk::Widget>()),
+        None => None,
+    }
+}
+
+fn build_subtitle_prefix(kind: Option<MatchKind>, icon_name: Option<&str>) -> Option<Image> {
+    match kind {
+        Some(MatchKind::Window) => build_application_icon(icon_name, SUBTITLE_ICON_SIZE),
         _ => None,
     }
 }
 
-fn build_application_icon(icon_name: Option<&str>) -> Option<Image> {
+fn build_application_icon(icon_name: Option<&str>, size: i32) -> Option<Image> {
     let icon_name = icon_name?.trim();
     if icon_name.is_empty() {
         return None;
@@ -397,9 +417,15 @@ fn build_application_icon(icon_name: Option<&str>) -> Option<Image> {
         Image::from_icon_name(icon_name)
     };
 
-    image.set_pixel_size(RESULT_ICON_SIZE);
+    image.set_pixel_size(size);
     image.set_valign(gtk::Align::Start);
     Some(image)
+}
+
+fn build_symbol_label(symbol: &str) -> Label {
+    let label = Label::new(Some(symbol));
+    label.set_valign(gtk::Align::Start);
+    label
 }
 
 fn move_selection(list_box: &ListBox, offset: i32) {

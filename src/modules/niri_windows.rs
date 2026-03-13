@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -8,7 +9,9 @@ use crate::module::{ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, Sea
 
 const MODULE_KEY: &str = "niri-windows";
 
-pub struct NiriWindowsModule;
+pub struct NiriWindowsModule {
+    icon_index: HashMap<String, String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct NiriWindow {
@@ -23,7 +26,12 @@ struct NiriWindow {
 
 impl NiriWindowsModule {
     pub fn new() -> Self {
-        Self
+        Self {
+            icon_index: crate::modules::applications::load_icon_index().unwrap_or_else(|err| {
+                eprintln!("failed to load application icon index: {err:#}");
+                HashMap::new()
+            }),
+        }
     }
 }
 
@@ -57,7 +65,7 @@ impl Module for NiriWindowsModule {
                     item_id: window.id.to_string(),
                     title: window.title,
                     subtitle,
-                    icon_name: None,
+                    icon_name: icon_name_for_app_id(&self.icon_index, &window.app_id),
                     kind: MatchKind::Window,
                     actions: Vec::new(),
                     score,
@@ -110,4 +118,19 @@ fn load_windows() -> Result<Vec<NiriWindow>> {
     }
 
     serde_json::from_slice(&output.stdout).context("failed to parse niri windows JSON")
+}
+
+fn icon_name_for_app_id(icon_index: &HashMap<String, String>, app_id: &str) -> Option<String> {
+    let app_id = app_id.trim();
+    if app_id.is_empty() {
+        return None;
+    }
+
+    icon_index
+        .get(app_id)
+        .or_else(|| {
+            let desktop_id = format!("{app_id}.desktop");
+            icon_index.get(&desktop_id)
+        })
+        .cloned()
 }

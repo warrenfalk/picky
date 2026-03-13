@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,30 @@ impl ApplicationsModule {
                 Vec::new()
             }),
         }
+    }
+}
+
+pub fn load_icon_index() -> Result<HashMap<String, String>> {
+    let mut icons = HashMap::new();
+
+    for entry in load_entries()? {
+        let Some(icon_name) = entry.icon_name.clone().filter(|icon| !icon.is_empty()) else {
+            continue;
+        };
+
+        insert_icon_aliases(&mut icons, &entry.id, &icon_name);
+    }
+
+    Ok(icons)
+}
+
+fn insert_icon_aliases(icons: &mut HashMap<String, String>, desktop_id: &str, icon_name: &str) {
+    icons.entry(desktop_id.to_string()).or_insert_with(|| icon_name.to_string());
+
+    if let Some(stripped) = desktop_id.strip_suffix(".desktop") {
+        icons
+            .entry(stripped.to_string())
+            .or_insert_with(|| icon_name.to_string());
     }
 }
 
