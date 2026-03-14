@@ -9,7 +9,7 @@ use iced::widget::{
     Id, button, column, container, image, mouse_area, row, scrollable, text, text_input,
 };
 use iced::widget::operation::{focus, focus_next, focus_previous};
-use iced::{Element, Length, Size, Subscription, Task, Theme, window};
+use iced::{Background, Element, Length, Size, Subscription, Task, Theme, border, window};
 use serde::Deserialize;
 
 use crate::module::{
@@ -295,13 +295,7 @@ fn view_result_row<'a>(
     let is_selected = app.selected_index == Some(index);
     let show_action_hints = is_selected && app.focus_target == FocusTarget::Results;
 
-    let title = if is_selected {
-        format!("> {}", result.title)
-    } else {
-        result.title.clone()
-    };
-
-    let mut text_column = column![text(title).size(18)].spacing(4);
+    let mut text_column = column![text(&result.title).size(18)].spacing(4);
 
     if !result.subtitle.trim().is_empty() {
         let subtitle_line = if let Some(icon_path) = subtitle_icon_path(result) {
@@ -331,10 +325,48 @@ fn view_result_row<'a>(
         button(container(row_content).width(Length::Fill))
             .width(Length::Fill)
             .padding(10)
+            .style(move |theme, status| result_row_button_style(theme, status, is_selected))
             .on_press(Message::ResultSelected(index)),
     )
     .on_double_click(Message::ResultActivated(index))
     .into()
+}
+
+fn result_row_button_style(
+    theme: &Theme,
+    status: button::Status,
+    is_selected: bool,
+) -> button::Style {
+    let palette = theme.extended_palette();
+
+    if is_selected {
+        let background = match status {
+            button::Status::Hovered | button::Status::Pressed => palette.primary.strong.color,
+            button::Status::Active | button::Status::Disabled => palette.primary.base.color,
+        };
+
+        return button::Style {
+            background: Some(Background::Color(background)),
+            text_color: palette.primary.base.text,
+            border: border::rounded(10)
+                .width(1)
+                .color(palette.primary.strong.color),
+            ..button::Style::default()
+        };
+    }
+
+    let background = match status {
+        button::Status::Hovered => Some(Background::Color(palette.background.weak.color)),
+        button::Status::Pressed => Some(Background::Color(palette.background.strong.color)),
+        button::Status::Active | button::Status::Disabled => None,
+    };
+
+    button::Style {
+        background,
+        text_color: palette.background.base.text,
+        border: border::rounded(10),
+        ..button::Style::default()
+    }
 }
 
 impl PickerApp {
