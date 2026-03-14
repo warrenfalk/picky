@@ -50,14 +50,6 @@ fn build_ui(app: &Application) {
     container.set_margin_start(18);
     container.set_margin_end(18);
 
-    let title = Label::new(Some("picky"));
-    title.add_css_class("title-2");
-    title.set_halign(gtk::Align::Center);
-
-    let subtitle = Label::new(Some("Search notifications, applications, and Niri windows"));
-    subtitle.add_css_class("dim-label");
-    subtitle.set_halign(gtk::Align::Center);
-
     let search_entry = Entry::new();
     search_entry.set_hexpand(true);
     search_entry.set_placeholder_text(Some("Type to search"));
@@ -84,8 +76,6 @@ fn build_ui(app: &Application) {
     error_label.set_halign(gtk::Align::Start);
     error_label.add_css_class("error");
 
-    container.append(&title);
-    container.append(&subtitle);
     container.append(&search_entry);
     container.append(&results_label);
     container.append(&scroller);
