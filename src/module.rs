@@ -2,13 +2,13 @@ use anyhow::{anyhow, Result};
 
 pub const DEFAULT_ACTION_ID: &str = "default";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ActivationOutcome {
     ClosePicker,
     RefreshResults,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum MatchKind {
     Application,
     Notification,
@@ -16,7 +16,7 @@ pub enum MatchKind {
     Workspace,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ResultAction {
     pub id: &'static str,
     #[allow(dead_code)]
@@ -24,7 +24,7 @@ pub struct ResultAction {
     pub shortcut: char,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SearchResult {
     pub module_key: &'static str,
     pub item_id: String,

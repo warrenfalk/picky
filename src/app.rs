@@ -1,12 +1,15 @@
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::hash::{Hash, Hasher};
 
 use iced::event;
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{
-    Id, button, column, container, image, mouse_area, row, scrollable, text, text_input,
+    Id, button, column, container, image, keyed_column, lazy, mouse_area, row, scrollable, text,
+    text_input,
 };
 use iced::widget::operation::{focus, focus_next, focus_previous};
 use iced::{Background, Element, Length, Size, Subscription, Task, Theme, border, window};
@@ -251,17 +254,32 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
         .padding(12)
         .size(24);
 
-    let results_list = if app.results.is_empty() {
+    let results_list: Element<'_, Message> = if app.results.is_empty() {
         column![text("No matches.")]
             .spacing(8)
             .width(Length::Fill)
+            .into()
     } else {
-        app.results
+        let rows = app
+            .results
             .iter()
             .enumerate()
-            .fold(column![].spacing(6).width(Length::Fill), |column, (index, result)| {
-                column.push(view_result_row(app, index, result))
+            .map(|(index, result)| {
+                let row = ResultRowView {
+                    result: result.clone(),
+                    is_selected: app.selected_index == Some(index),
+                    show_action_hints: app.selected_index == Some(index)
+                        && app.focus_target == FocusTarget::Results,
+                };
+
+                (
+                    row_key(&row.result),
+                    lazy(row, move |row| view_result_row(index, row)).into(),
+                )
             })
+            .collect::<Vec<_>>();
+
+        keyed_column(rows).spacing(6).width(Length::Fill).into()
     };
 
     let error = if app.error_message.is_empty() {
@@ -287,15 +305,22 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
     .into()
 }
 
-fn view_result_row<'a>(
-    app: &'a PickerApp,
-    index: usize,
-    result: &'a SearchResult,
-) -> Element<'a, Message> {
-    let is_selected = app.selected_index == Some(index);
-    let show_action_hints = is_selected && app.focus_target == FocusTarget::Results;
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ResultRowView {
+    result: SearchResult,
+    is_selected: bool,
+    show_action_hints: bool,
+}
 
-    let mut text_column = column![text(&result.title).size(18)].spacing(4);
+fn view_result_row(
+    index: usize,
+    row_state: &ResultRowView,
+) -> Element<'static, Message> {
+    let is_selected = row_state.is_selected;
+    let show_action_hints = row_state.show_action_hints;
+    let result = &row_state.result;
+
+    let mut text_column = column![text(result.title.clone()).size(18)].spacing(4);
 
     if !result.subtitle.trim().is_empty() {
         let subtitle_line = if let Some(icon_path) = subtitle_icon_path(result) {
@@ -303,11 +328,11 @@ fn view_result_row<'a>(
                 image(image::Handle::from_path(icon_path))
                     .width(SUBTITLE_ICON_SIZE)
                     .height(SUBTITLE_ICON_SIZE),
-                text(&result.subtitle).size(14)
+                text(result.subtitle.clone()).size(14)
             ]
             .spacing(6)
         } else {
-            row![text(&result.subtitle).size(14)]
+            row![text(result.subtitle.clone()).size(14)]
         };
 
         text_column = text_column.push(subtitle_line);
@@ -330,6 +355,13 @@ fn view_result_row<'a>(
     )
     .on_double_click(Message::ResultActivated(index))
     .into()
+}
+
+fn row_key(result: &SearchResult) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    result.module_key.hash(&mut hasher);
+    result.item_id.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn result_row_button_style(
@@ -496,7 +528,7 @@ fn activate_result(
     .map_err(|error| error.to_string())
 }
 
-fn leading_visual<'a>(result: &'a SearchResult) -> Element<'a, Message> {
+fn leading_visual(result: &SearchResult) -> Element<'static, Message> {
     if let Some(icon_path) = leading_icon_path(result) {
         image(image::Handle::from_path(icon_path))
             .width(RESULT_ICON_SIZE)
