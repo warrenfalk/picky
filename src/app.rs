@@ -524,19 +524,30 @@ fn format_action_hints(actions: &[ResultAction]) -> String {
 }
 
 fn initial_window_height() -> f32 {
-    focused_output_height()
-        .map(|height| ((height as f32) * WINDOW_HEIGHT_FRACTION).round().max(360.0))
-        .unwrap_or(DEFAULT_WINDOW_HEIGHT)
+    window_height_for_output_height(focused_output_height())
 }
 
 fn focused_output_height() -> Option<i32> {
     let focused_output = load_focused_output_name()?;
     let outputs = load_outputs().ok()?;
 
+    focused_output_height_for(&focused_output, &outputs)
+}
+
+fn focused_output_height_for(
+    focused_output: &str,
+    outputs: &HashMap<String, NiriOutput>,
+) -> Option<i32> {
     outputs
-        .get(&focused_output)
+        .get(focused_output)
         .map(|output| output.logical.height)
         .or_else(|| outputs.values().next().map(|output| output.logical.height))
+}
+
+fn window_height_for_output_height(output_height: Option<i32>) -> f32 {
+    output_height
+        .map(|height| ((height as f32) * WINDOW_HEIGHT_FRACTION).round().max(360.0))
+        .unwrap_or(DEFAULT_WINDOW_HEIGHT)
 }
 
 fn load_focused_output_name() -> Option<String> {
@@ -567,4 +578,194 @@ fn load_outputs() -> Result<HashMap<String, NiriOutput>, serde_json::Error> {
     }
 
     serde_json::from_slice(&outputs.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_with_results(results: Vec<SearchResult>) -> PickerApp {
+        PickerApp {
+            registry: Arc::new(Mutex::new(ModuleRegistry::new(Vec::new()))),
+            query: String::new(),
+            error_message: String::new(),
+            selected_index: (!results.is_empty()).then_some(0),
+            results,
+            focus_target: FocusTarget::Search,
+            search_request_id: 0,
+            active_search_request_id: 0,
+            search_input_id: Id::unique(),
+        }
+    }
+
+    fn result(title: &str, actions: Vec<ResultAction>) -> SearchResult {
+        SearchResult {
+            module_key: "test",
+            item_id: title.to_string(),
+            title: title.to_string(),
+            subtitle: String::new(),
+            icon_name: None,
+            kind: MatchKind::Application,
+            actions,
+            score: 1,
+        }
+    }
+
+    #[test]
+    fn query_changed_updates_query_and_requests_search() {
+        let mut app = app_with_results(Vec::new());
+
+        let _ = update(&mut app, Message::QueryChanged("fire".to_string()));
+
+        assert_eq!(app.query, "fire");
+        assert_eq!(app.focus_target, FocusTarget::Search);
+        assert_eq!(app.search_request_id, 1);
+        assert_eq!(app.active_search_request_id, 1);
+    }
+
+    #[test]
+    fn down_from_search_moves_focus_to_results() {
+        let mut app = app_with_results(vec![result("Firefox", Vec::new())]);
+
+        let _ = app.handle_search_key(AppKey::Down);
+
+        assert_eq!(app.focus_target, FocusTarget::Results);
+        assert_eq!(app.selected_index, Some(0));
+    }
+
+    #[test]
+    fn down_and_up_move_results_selection() {
+        let mut app = app_with_results(vec![
+            result("Firefox", Vec::new()),
+            result("Calculator", Vec::new()),
+        ]);
+        app.focus_target = FocusTarget::Results;
+
+        let _ = app.handle_results_key(AppKey::Down);
+        assert_eq!(app.selected_index, Some(1));
+
+        let _ = app.handle_results_key(AppKey::Up);
+        assert_eq!(app.selected_index, Some(0));
+    }
+
+    #[test]
+    fn up_at_first_result_returns_focus_to_search() {
+        let mut app = app_with_results(vec![result("Firefox", Vec::new())]);
+        app.focus_target = FocusTarget::Results;
+        app.selected_index = Some(0);
+
+        let _ = app.handle_results_key(AppKey::Up);
+
+        assert_eq!(app.focus_target, FocusTarget::Search);
+        assert_eq!(app.selected_index, Some(0));
+    }
+
+    #[test]
+    fn shortcut_selects_matching_action_case_insensitively() {
+        let app = app_with_results(vec![result(
+            "Firefox",
+            vec![ResultAction {
+                id: "close",
+                label: "close",
+                shortcut: 'Q',
+            }],
+        )]);
+
+        assert_eq!(app.selected_action_id_for_shortcut('q'), Some("close"));
+        assert_eq!(app.selected_action_id_for_shortcut('Q'), Some("close"));
+    }
+
+    #[test]
+    fn stale_search_results_are_ignored() {
+        let mut app = app_with_results(vec![result("Old", Vec::new())]);
+        app.active_search_request_id = 2;
+
+        let _ = update(
+            &mut app,
+            Message::SearchFinished {
+                request_id: 1,
+                result: Ok(vec![result("New", Vec::new())]),
+            },
+        );
+
+        assert_eq!(app.results[0].title, "Old");
+    }
+
+    #[test]
+    fn search_results_replace_state_and_select_first() {
+        let mut app = app_with_results(Vec::new());
+        app.active_search_request_id = 1;
+
+        let _ = update(
+            &mut app,
+            Message::SearchFinished {
+                request_id: 1,
+                result: Ok(vec![result("Firefox", Vec::new()), result("Calc", Vec::new())]),
+            },
+        );
+
+        assert_eq!(app.results.len(), 2);
+        assert_eq!(app.selected_index, Some(0));
+        assert!(app.error_message.is_empty());
+    }
+
+    #[test]
+    fn search_error_clears_results_and_error_message() {
+        let mut app = app_with_results(vec![result("Firefox", Vec::new())]);
+        app.active_search_request_id = 1;
+        app.focus_target = FocusTarget::Results;
+
+        let _ = update(
+            &mut app,
+            Message::SearchFinished {
+                request_id: 1,
+                result: Err("boom".to_string()),
+            },
+        );
+
+        assert!(app.results.is_empty());
+        assert_eq!(app.selected_index, None);
+        assert_eq!(app.error_message, "boom");
+        assert_eq!(app.focus_target, FocusTarget::Search);
+    }
+
+    #[test]
+    fn refresh_activation_requests_new_search() {
+        let mut app = app_with_results(Vec::new());
+
+        let _ = update(
+            &mut app,
+            Message::ActivationFinished(Ok(ActivationOutcome::RefreshResults)),
+        );
+
+        assert_eq!(app.search_request_id, 1);
+        assert_eq!(app.active_search_request_id, 1);
+    }
+
+    #[test]
+    fn focused_output_height_prefers_focused_output() {
+        let outputs = HashMap::from([
+            (
+                "DP-1".to_string(),
+                NiriOutput {
+                    logical: NiriLogicalOutput { height: 1000 },
+                },
+            ),
+            (
+                "DP-2".to_string(),
+                NiriOutput {
+                    logical: NiriLogicalOutput { height: 2000 },
+                },
+            ),
+        ]);
+
+        assert_eq!(focused_output_height_for("DP-2", &outputs), Some(2000));
+    }
+
+    #[test]
+    fn window_height_uses_fraction_and_clamp() {
+        assert_eq!(window_height_for_output_height(Some(1000)), 700.0);
+        assert_eq!(window_height_for_output_height(Some(100)), 360.0);
+        assert_eq!(window_height_for_output_height(None), DEFAULT_WINDOW_HEIGHT);
+    }
 }

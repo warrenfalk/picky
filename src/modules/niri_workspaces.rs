@@ -8,7 +8,9 @@ use crate::module::{ActivationOutcome, MatchKind, Module, SearchResult, DEFAULT_
 
 const MODULE_KEY: &str = "niri-workspaces";
 
-pub struct NiriWorkspacesModule;
+pub struct NiriWorkspacesModule {
+    backend: Box<dyn WorkspaceBackend>,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 struct NiriWorkspace {
@@ -22,9 +24,30 @@ struct NiriWorkspace {
     is_focused: bool,
 }
 
+trait WorkspaceBackend: Send {
+    fn load_workspaces(&self) -> Result<Vec<NiriWorkspace>>;
+    fn run_action(&self, action: &str, target: &str) -> Result<()>;
+}
+
+struct ProcessWorkspaceBackend;
+
+impl WorkspaceBackend for ProcessWorkspaceBackend {
+    fn load_workspaces(&self) -> Result<Vec<NiriWorkspace>> {
+        load_workspaces()
+    }
+
+    fn run_action(&self, action: &str, target: &str) -> Result<()> {
+        run_niri_action([action, target])
+    }
+}
+
 impl NiriWorkspacesModule {
     pub fn new() -> Self {
-        Self
+        Self::with_backend(Box::new(ProcessWorkspaceBackend))
+    }
+
+    fn with_backend(backend: Box<dyn WorkspaceBackend>) -> Self {
+        Self { backend }
     }
 }
 
@@ -35,7 +58,7 @@ impl Module for NiriWorkspacesModule {
 
     fn search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
         let query = query.trim();
-        let mut workspaces = load_workspaces()?;
+        let mut workspaces = self.backend.load_workspaces()?;
 
         workspaces.sort_by(|left, right| {
             left.output
@@ -95,12 +118,15 @@ impl Module for NiriWorkspacesModule {
         let workspace_id = item_id
             .parse::<u64>()
             .with_context(|| format!("invalid workspace id: {item_id}"))?;
-        let workspace = load_workspaces()?
+        let workspace = self
+            .backend
+            .load_workspaces()?
             .into_iter()
             .find(|workspace| workspace.id == workspace_id)
             .ok_or_else(|| anyhow::anyhow!("workspace {workspace_id} no longer exists"))?;
 
-        run_niri_action(["focus-monitor", workspace.output.as_str()])?;
+        self.backend
+            .run_action("focus-monitor", workspace.output.as_str())?;
 
         let reference = workspace
             .name
@@ -109,7 +135,8 @@ impl Module for NiriWorkspacesModule {
             .filter(|name| !name.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| workspace.idx.to_string());
-        run_niri_action(["focus-workspace", reference.as_str()])?;
+        self.backend
+            .run_action("focus-workspace", reference.as_str())?;
 
         Ok(ActivationOutcome::ClosePicker)
     }
@@ -166,4 +193,111 @@ fn run_niri_action(args: [&str; 2]) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct FakeState {
+        workspaces: Vec<NiriWorkspace>,
+        actions: Vec<(String, String)>,
+    }
+
+    struct FakeWorkspaceBackend {
+        state: Arc<Mutex<FakeState>>,
+    }
+
+    impl WorkspaceBackend for FakeWorkspaceBackend {
+        fn load_workspaces(&self) -> Result<Vec<NiriWorkspace>> {
+            Ok(self.state.lock().unwrap().workspaces.clone())
+        }
+
+        fn run_action(&self, action: &str, target: &str) -> Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .actions
+                .push((action.to_string(), target.to_string()));
+            Ok(())
+        }
+    }
+
+    fn workspace(
+        id: u64,
+        idx: u64,
+        name: Option<&str>,
+        output: &str,
+        is_active: bool,
+        is_focused: bool,
+    ) -> NiriWorkspace {
+        NiriWorkspace {
+            id,
+            idx,
+            name: name.map(ToOwned::to_owned),
+            output: output.to_string(),
+            is_active,
+            is_focused,
+        }
+    }
+
+    #[test]
+    fn search_empty_query_boosts_focused_workspace() {
+        let state = Arc::new(Mutex::new(FakeState {
+            workspaces: vec![
+                workspace(1, 1, Some("chat"), "DP-1", false, false),
+                workspace(2, 2, Some("code"), "DP-1", true, true),
+            ],
+            ..FakeState::default()
+        }));
+        let mut module = NiriWorkspacesModule::with_backend(Box::new(FakeWorkspaceBackend {
+            state,
+        }));
+
+        let results = module.search("").unwrap();
+
+        assert_eq!(results[0].item_id, "2");
+    }
+
+    #[test]
+    fn activate_focuses_monitor_then_named_workspace() {
+        let state = Arc::new(Mutex::new(FakeState {
+            workspaces: vec![workspace(2, 2, Some("code"), "DP-1", true, true)],
+            ..FakeState::default()
+        }));
+        let mut module = NiriWorkspacesModule::with_backend(Box::new(FakeWorkspaceBackend {
+            state: Arc::clone(&state),
+        }));
+
+        let outcome = module.activate("2", DEFAULT_ACTION_ID).unwrap();
+
+        assert_eq!(outcome, ActivationOutcome::ClosePicker);
+        assert_eq!(
+            state.lock().unwrap().actions.as_slice(),
+            [
+                ("focus-monitor".to_string(), "DP-1".to_string()),
+                ("focus-workspace".to_string(), "code".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn activate_falls_back_to_workspace_index() {
+        let state = Arc::new(Mutex::new(FakeState {
+            workspaces: vec![workspace(3, 7, None, "DP-2", false, false)],
+            ..FakeState::default()
+        }));
+        let mut module = NiriWorkspacesModule::with_backend(Box::new(FakeWorkspaceBackend {
+            state: Arc::clone(&state),
+        }));
+
+        module.activate("3", DEFAULT_ACTION_ID).unwrap();
+
+        assert_eq!(
+            state.lock().unwrap().actions[1],
+            ("focus-workspace".to_string(), "7".to_string())
+        );
+    }
 }

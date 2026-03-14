@@ -14,6 +14,17 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
+        runtimeLibs = with pkgs; [
+          wayland
+          libxkbcommon
+          xorg.libX11
+          xorg.libXcursor
+          xorg.libXi
+          xorg.libXrandr
+          libGL
+          vulkan-loader
+        ];
+        runtimeLibraryPath = pkgs.lib.makeLibraryPath runtimeLibs;
         rustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
           extensions = [ "clippy" "rust-src" "rustfmt" ];
         };
@@ -33,9 +44,10 @@
           ];
           buildInputs = with pkgs; [
             gtk4
-          ];
+          ] ++ runtimeLibs;
           postFixup = ''
             wrapProgram "$out/bin/picky" \
+              --prefix LD_LIBRARY_PATH : ${runtimeLibraryPath} \
               --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.firefox pkgs.gtk3 pkgs.niri ]}
           '';
         };
@@ -60,16 +72,17 @@
             gtk3
             gtk4
             niri
-          ];
+          ] ++ runtimeLibs;
 
           buildInputs = with pkgs; [
             gtk4
-          ];
+          ] ++ runtimeLibs;
 
           NIX_SHELL_PRESERVE_PROMPT = "1";
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
 
           shellHook = ''
+            export LD_LIBRARY_PATH="${runtimeLibraryPath}:''${LD_LIBRARY_PATH:-}"
             export PS1="(picky) ''${PS1:-\\u@\\h:\\w \\$ }"
           '';
         };

@@ -13,9 +13,11 @@ const MODULE_KEY: &str = "mako-notifications";
 const EMPTY_QUERY_BASE_SCORE: i64 = 10_000;
 const DISMISS_ACTION_ID: &str = "dismiss";
 
-pub struct MakoNotificationsModule;
+pub struct MakoNotificationsModule {
+    client: Box<dyn MakoClient>,
+}
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Notification {
     id: u64,
     app_name: String,
@@ -29,9 +31,43 @@ struct BusctlResponse {
     data: Vec<Vec<Value>>,
 }
 
+trait MakoClient: Send {
+    fn list_notifications(&self) -> Result<Vec<Notification>>;
+    fn invoke(&self, item_id: &str) -> Result<bool>;
+    fn dismiss(&self, item_id: &str) -> Result<()>;
+}
+
+struct ProcessMakoClient;
+
+impl MakoClient for ProcessMakoClient {
+    fn list_notifications(&self) -> Result<Vec<Notification>> {
+        load_notifications()
+    }
+
+    fn invoke(&self, item_id: &str) -> Result<bool> {
+        let invoke_status = Command::new("makoctl")
+            .args(["invoke", "-n", item_id])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("failed to invoke notification {item_id}"))?;
+
+        Ok(invoke_status.success())
+    }
+
+    fn dismiss(&self, item_id: &str) -> Result<()> {
+        dismiss_notification(item_id)
+    }
+}
+
 impl MakoNotificationsModule {
     pub fn new() -> Self {
-        Self
+        Self::with_client(Box::new(ProcessMakoClient))
+    }
+
+    fn with_client(client: Box<dyn MakoClient>) -> Self {
+        Self { client }
     }
 }
 
@@ -42,7 +78,7 @@ impl Module for MakoNotificationsModule {
 
     fn search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
         let query = query.trim();
-        let notifications = load_notifications()?;
+        let notifications = self.client.list_notifications()?;
 
         let mut results = notifications
             .into_iter()
@@ -102,27 +138,19 @@ impl Module for MakoNotificationsModule {
     fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome> {
         match action_id {
             DEFAULT_ACTION_ID => {
-                let invoke_status = Command::new("makoctl")
-                    .args(["invoke", "-n", item_id])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .with_context(|| format!("failed to invoke notification {item_id}"))?;
-
-                if invoke_status.success() {
-                    dismiss_notification(item_id)?;
+                if self.client.invoke(item_id)? {
+                    self.client.dismiss(item_id)?;
                     return Ok(ActivationOutcome::ClosePicker);
                 }
 
-                dismiss_notification(item_id).map_err(|_| {
+                self.client.dismiss(item_id).map_err(|_| {
                     anyhow::anyhow!("mako refused to invoke or dismiss notification {item_id}")
                 })?;
 
                 Ok(ActivationOutcome::ClosePicker)
             }
             DISMISS_ACTION_ID => {
-                dismiss_notification(item_id)?;
+                self.client.dismiss(item_id)?;
                 Ok(ActivationOutcome::RefreshResults)
             }
             _ => bail!("unknown notification action: {action_id}"),
@@ -216,4 +244,115 @@ fn dismiss_notification(item_id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct FakeState {
+        notifications: Vec<Notification>,
+        invokes: Vec<String>,
+        dismisses: Vec<String>,
+        invoke_success: bool,
+    }
+
+    struct FakeMakoClient {
+        state: Arc<Mutex<FakeState>>,
+    }
+
+    impl MakoClient for FakeMakoClient {
+        fn list_notifications(&self) -> Result<Vec<Notification>> {
+            Ok(self.state.lock().unwrap().notifications.clone())
+        }
+
+        fn invoke(&self, item_id: &str) -> Result<bool> {
+            let mut state = self.state.lock().unwrap();
+            state.invokes.push(item_id.to_string());
+            Ok(state.invoke_success)
+        }
+
+        fn dismiss(&self, item_id: &str) -> Result<()> {
+            self.state.lock().unwrap().dismisses.push(item_id.to_string());
+            Ok(())
+        }
+    }
+
+    fn notification(id: u64, app_name: &str, summary: &str, body: &str, urgency: u8) -> Notification {
+        Notification {
+            id,
+            app_name: app_name.to_string(),
+            summary: summary.to_string(),
+            body: body.to_string(),
+            urgency,
+        }
+    }
+
+    #[test]
+    fn search_empty_query_keeps_newest_first() {
+        let state = Arc::new(Mutex::new(FakeState {
+            notifications: vec![
+                notification(1, "Mail", "Old", "", 0),
+                notification(2, "Mail", "New", "", 0),
+            ],
+            ..FakeState::default()
+        }));
+        let mut module = MakoNotificationsModule::with_client(Box::new(FakeMakoClient {
+            state,
+        }));
+
+        let results = module.search("").unwrap();
+
+        assert_eq!(results[0].title, "New");
+        assert_eq!(results[0].actions[0].id, DISMISS_ACTION_ID);
+    }
+
+    #[test]
+    fn default_activate_invokes_then_dismisses() {
+        let state = Arc::new(Mutex::new(FakeState {
+            invoke_success: true,
+            ..FakeState::default()
+        }));
+        let mut module = MakoNotificationsModule::with_client(Box::new(FakeMakoClient {
+            state: Arc::clone(&state),
+        }));
+
+        let outcome = module.activate("42", DEFAULT_ACTION_ID).unwrap();
+
+        assert_eq!(outcome, ActivationOutcome::ClosePicker);
+        let state = state.lock().unwrap();
+        assert_eq!(state.invokes.as_slice(), ["42"]);
+        assert_eq!(state.dismisses.as_slice(), ["42"]);
+    }
+
+    #[test]
+    fn failed_invoke_still_dismisses() {
+        let state = Arc::new(Mutex::new(FakeState {
+            invoke_success: false,
+            ..FakeState::default()
+        }));
+        let mut module = MakoNotificationsModule::with_client(Box::new(FakeMakoClient {
+            state: Arc::clone(&state),
+        }));
+
+        let outcome = module.activate("42", DEFAULT_ACTION_ID).unwrap();
+
+        assert_eq!(outcome, ActivationOutcome::ClosePicker);
+        assert_eq!(state.lock().unwrap().dismisses.as_slice(), ["42"]);
+    }
+
+    #[test]
+    fn dismiss_action_refreshes_results() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut module = MakoNotificationsModule::with_client(Box::new(FakeMakoClient {
+            state: Arc::clone(&state),
+        }));
+
+        let outcome = module.activate("42", DISMISS_ACTION_ID).unwrap();
+
+        assert_eq!(outcome, ActivationOutcome::RefreshResults);
+        assert_eq!(state.lock().unwrap().dismisses.as_slice(), ["42"]);
+    }
 }
