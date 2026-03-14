@@ -288,7 +288,7 @@ fn refresh_results(
     results_label.set_text(&format!("{} results", state.results.len()));
 
     if state.results.is_empty() {
-        let row = build_row(None, "No matches.", "", None);
+        let row = build_row(None, "No matches.", "", None, &[]);
         list_box.append(&row);
         return;
     }
@@ -299,6 +299,7 @@ fn refresh_results(
             &result.title,
             &result.subtitle,
             result.icon_name.as_deref(),
+            &result.actions,
         );
         list_box.append(&row);
     }
@@ -313,6 +314,7 @@ fn build_row(
     title: &str,
     subtitle: &str,
     icon_name: Option<&str>,
+    actions: &[crate::module::ResultAction],
 ) -> ListBoxRow {
     let row = ListBoxRow::new();
     let content = GtkBox::new(Orientation::Horizontal, 10);
@@ -369,6 +371,36 @@ fn build_row(
             text_content.append(&subtitle_label);
         }
     }
+
+    if !actions.is_empty() {
+        let action_label = Label::new(Some(&format_action_hints(actions)));
+        action_label.set_halign(gtk::Align::Start);
+        action_label.set_xalign(0.0);
+        action_label.set_hexpand(true);
+        action_label.set_wrap(false);
+        action_label.set_ellipsize(EllipsizeMode::End);
+        action_label.set_single_line_mode(true);
+        action_label.add_css_class("dim-label");
+        action_label.set_visible(false);
+
+        {
+            let action_label = action_label.clone();
+            row.connect_notify_local(Some("is-selected"), move |row, _| {
+                update_action_hint_visibility(row, &action_label);
+            });
+        }
+
+        {
+            let action_label = action_label.clone();
+            row.connect_has_focus_notify(move |row| {
+                update_action_hint_visibility(row, &action_label);
+            });
+        }
+
+        update_action_hint_visibility(&row, &action_label);
+        text_content.append(&action_label);
+    }
+
     content.append(&text_content);
     row.set_child(Some(&content));
     row
@@ -426,6 +458,7 @@ fn move_selection(list_box: &ListBox, offset: i32) {
 
     if let Some(row) = list_box.row_at_index(next_index) {
         list_box.select_row(Some(&row));
+        row.grab_focus();
     }
 }
 
@@ -441,6 +474,18 @@ fn focus_results_list(list_box: &ListBox) {
     } else {
         list_box.grab_focus();
     }
+}
+
+fn format_action_hints(actions: &[crate::module::ResultAction]) -> String {
+    actions
+        .iter()
+        .map(|action| format!("{} - {}", action.shortcut, action.label))
+        .collect::<Vec<_>>()
+        .join("   ")
+}
+
+fn update_action_hint_visibility(row: &ListBoxRow, action_label: &Label) {
+    action_label.set_visible(row.is_selected() && row.has_focus());
 }
 
 fn selected_row_index(list_box: &ListBox) -> Option<i32> {
