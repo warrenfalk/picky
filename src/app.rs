@@ -1,32 +1,27 @@
-use std::convert::identity;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
 
-use relm4::factory::{FactoryComponent, FactorySender, FactoryVecDeque};
-use relm4::gtk;
-use relm4::prelude::*;
-use relm4::{Worker, WorkerController};
-
-use gtk::gdk;
-use gtk::glib;
-use gtk::pango::EllipsizeMode;
-use gtk::prelude::*;
-use gtk::{
-    ApplicationWindow, Box as GtkBox, Entry, EventControllerKey, Image, Label, ListBox,
-    Orientation, PolicyType, ScrolledWindow, SelectionMode, Stack,
+use iced::event;
+use iced::keyboard::{self, Key, key::Named};
+use iced::widget::{
+    Id, button, column, container, image, mouse_area, row, scrollable, text, text_input,
 };
+use iced::widget::operation::{focus, focus_next, focus_previous};
+use iced::{Element, Length, Size, Subscription, Task, Theme, window};
+use serde::Deserialize;
 
 use crate::module::{
     ActivationOutcome, MatchKind, ModuleRegistry, ResultAction, SearchResult, DEFAULT_ACTION_ID,
 };
 use crate::modules;
 
-const WINDOW_WIDTH: i32 = 820;
-const WINDOW_HEIGHT_FRACTION: f64 = 0.7;
-const WINDOW_CONTENT_WIDTH: i32 = WINDOW_WIDTH - 36;
-const RESULT_ICON_SIZE: i32 = 28;
-const SUBTITLE_ICON_SIZE: i32 = 22;
-const RESULTS_STACK_RESULTS: &str = "results";
-const RESULTS_STACK_EMPTY: &str = "empty";
+const WINDOW_WIDTH: f32 = 820.0;
+const DEFAULT_WINDOW_HEIGHT: f32 = 680.0;
+const WINDOW_HEIGHT_FRACTION: f32 = 0.7;
+const RESULT_ICON_SIZE: f32 = 28.0;
+const SUBTITLE_ICON_SIZE: f32 = 20.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FocusTarget {
@@ -34,229 +29,398 @@ enum FocusTarget {
     Results,
 }
 
-#[derive(Debug)]
-pub enum AppMsg {
+#[derive(Clone, Debug)]
+enum AppKey {
+    Down,
+    Up,
+    Enter,
+    Escape,
+    Shortcut(char),
+}
+
+#[derive(Clone, Debug)]
+enum Message {
     QueryChanged(String),
-    SearchEntryKeyPressed(gdk::Key),
-    ResultsKeyPressed(gdk::Key),
-    ResultsRowActivated(i32),
-    RowSelected(Option<i32>),
     ActivateSelected,
+    ActivateSelectedAction(&'static str),
+    ResultSelected(usize),
+    ResultActivated(usize),
+    KeyPressed(AppKey),
     SearchFinished {
-        query: String,
+        request_id: u64,
         result: Result<Vec<SearchResult>, String>,
     },
     ActivationFinished(Result<ActivationOutcome, String>),
-    Close,
-}
-
-#[derive(Debug)]
-enum SearchWorkerInput {
-    Search(String),
-    Activate {
-        result: SearchResult,
-        action_id: &'static str,
-    },
-}
-
-#[derive(Debug)]
-struct ResultRow {
-    result: SearchResult,
-    show_action_hints: bool,
-}
-
-#[relm4::factory]
-impl FactoryComponent for ResultRow {
-    type Init = SearchResult;
-    type Input = ();
-    type Output = ();
-    type CommandOutput = ();
-    type ParentWidget = gtk::ListBox;
-
-    view! {
-        root = gtk::Box {
-            set_orientation: gtk::Orientation::Horizontal,
-            set_spacing: 10,
-            set_margin_top: 8,
-            set_margin_bottom: 8,
-            set_margin_start: 8,
-            set_margin_end: 8,
-            set_hexpand: true,
-
-            #[name(leading_icon)]
-            gtk::Image {
-                set_visible: false,
-                set_pixel_size: RESULT_ICON_SIZE,
-                set_valign: gtk::Align::Start,
-            },
-
-            #[name(leading_symbol)]
-            gtk::Label {
-                set_visible: false,
-                set_valign: gtk::Align::Start,
-            },
-
-            gtk::Box {
-                set_orientation: gtk::Orientation::Vertical,
-                set_spacing: 4,
-                set_hexpand: true,
-
-                #[name(title_label)]
-                gtk::Label {
-                    set_halign: gtk::Align::Start,
-                    set_xalign: 0.0,
-                    set_hexpand: true,
-                    set_ellipsize: EllipsizeMode::End,
-                    set_single_line_mode: true,
-                },
-
-                #[name(subtitle_row)]
-                gtk::Box {
-                    set_orientation: gtk::Orientation::Horizontal,
-                    set_spacing: 6,
-                    set_hexpand: true,
-
-                    #[name(subtitle_icon)]
-                    gtk::Image {
-                        set_visible: false,
-                        set_pixel_size: SUBTITLE_ICON_SIZE,
-                        set_valign: gtk::Align::Start,
-                    },
-
-                    #[name(subtitle_label)]
-                    gtk::Label {
-                        set_halign: gtk::Align::Start,
-                        set_xalign: 0.0,
-                        set_hexpand: true,
-                        set_ellipsize: EllipsizeMode::End,
-                        set_single_line_mode: true,
-                        add_css_class: "dim-label",
-                    }
-                },
-
-                #[name(action_label)]
-                gtk::Label {
-                    set_halign: gtk::Align::Start,
-                    set_xalign: 0.0,
-                    set_hexpand: true,
-                    set_wrap: false,
-                    set_ellipsize: EllipsizeMode::End,
-                    set_single_line_mode: true,
-                    add_css_class: "dim-label",
-                    set_visible: false,
-                }
-            }
-        }
-    }
-
-    fn init_model(
-        result: Self::Init,
-        _index: &relm4::factory::DynamicIndex,
-        _sender: FactorySender<Self>,
-    ) -> Self {
-        Self {
-            result,
-            show_action_hints: false,
-        }
-    }
-
-    fn pre_view() {
-        widgets.title_label.set_label(&row_title(&self.result));
-        widgets.subtitle_label.set_label(&self.result.subtitle);
-        widgets
-            .subtitle_row
-            .set_visible(!self.result.subtitle.trim().is_empty());
-        widgets
-            .action_label
-            .set_label(&format_action_hints(&self.result.actions));
-        widgets
-            .action_label
-            .set_visible(self.show_action_hints && !self.result.actions.is_empty());
-
-        configure_leading_widgets(&self.result, &widgets.leading_icon, &widgets.leading_symbol);
-        configure_subtitle_icon(&self.result, &widgets.subtitle_icon);
-    }
-
-    fn update(&mut self, _message: Self::Input, _sender: FactorySender<Self>) {}
 }
 
 pub struct PickerApp {
-    worker: WorkerController<SearchWorker>,
-    results: FactoryVecDeque<ResultRow>,
+    registry: Arc<Mutex<ModuleRegistry>>,
     query: String,
     error_message: String,
+    results: Vec<SearchResult>,
     selected_index: Option<usize>,
     focus_target: FocusTarget,
+    search_request_id: u64,
+    active_search_request_id: u64,
+    search_input_id: Id,
 }
 
-pub struct PickerWidgets {
-    search_entry: Entry,
-    results_label: Label,
-    results_stack: Stack,
-    list_box: ListBox,
-    error_label: Label,
+#[derive(Debug, Deserialize)]
+struct NiriOutput {
+    logical: NiriLogicalOutput,
+}
+
+#[derive(Debug, Deserialize)]
+struct NiriLogicalOutput {
+    height: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct NiriWorkspaceInfo {
+    output: String,
+    #[serde(default)]
+    is_focused: bool,
+}
+
+pub fn run() -> iced::Result {
+    iced::application(initialize, update, view)
+        .subscription(subscription)
+        .theme(theme)
+        .window(window::Settings {
+            size: Size::new(WINDOW_WIDTH, initial_window_height()),
+            position: window::Position::Centered,
+            decorations: false,
+            resizable: false,
+            ..window::Settings::default()
+        })
+        .run()
+}
+
+fn theme(_app: &PickerApp) -> Theme {
+    Theme::Dark
+}
+
+fn initialize() -> (PickerApp, Task<Message>) {
+    let search_input_id = Id::unique();
+    let mut app = PickerApp {
+        registry: Arc::new(Mutex::new(ModuleRegistry::new(modules::default_modules()))),
+        query: String::new(),
+        error_message: String::new(),
+        results: Vec::new(),
+        selected_index: None,
+        focus_target: FocusTarget::Search,
+        search_request_id: 0,
+        active_search_request_id: 0,
+        search_input_id,
+    };
+
+    let task = Task::batch([
+        focus(app.search_input_id.clone()),
+        app.request_search(),
+    ]);
+
+    (app, task)
+}
+
+fn subscription(app: &PickerApp) -> Subscription<Message> {
+    match app.focus_target {
+        FocusTarget::Search => event::listen_with(search_event_message),
+        FocusTarget::Results => event::listen_with(results_event_message),
+    }
+}
+
+fn search_event_message(
+    event: iced::Event,
+    _status: event::Status,
+    _window: window::Id,
+) -> Option<Message> {
+    let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else {
+        return None;
+    };
+
+    search_key_message(key, modifiers)
+}
+
+fn results_event_message(
+    event: iced::Event,
+    _status: event::Status,
+    _window: window::Id,
+) -> Option<Message> {
+    let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else {
+        return None;
+    };
+
+    results_key_message(key, modifiers)
+}
+
+fn search_key_message(key: Key, _modifiers: keyboard::Modifiers) -> Option<Message> {
+    match key {
+        Key::Named(Named::ArrowDown) => Some(Message::KeyPressed(AppKey::Down)),
+        Key::Named(Named::Escape) => Some(Message::KeyPressed(AppKey::Escape)),
+        _ => None,
+    }
+}
+
+fn results_key_message(key: Key, _modifiers: keyboard::Modifiers) -> Option<Message> {
+    match key {
+        Key::Named(Named::ArrowDown) => Some(Message::KeyPressed(AppKey::Down)),
+        Key::Named(Named::ArrowUp) => Some(Message::KeyPressed(AppKey::Up)),
+        Key::Named(Named::Enter) => Some(Message::KeyPressed(AppKey::Enter)),
+        Key::Named(Named::Escape) => Some(Message::KeyPressed(AppKey::Escape)),
+        Key::Character(value) => value
+            .chars()
+            .next()
+            .map(|character| Message::KeyPressed(AppKey::Shortcut(character))),
+        _ => None,
+    }
+}
+
+fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
+    match message {
+        Message::QueryChanged(query) => {
+            app.query = query;
+            app.focus_target = FocusTarget::Search;
+            app.request_search()
+        }
+        Message::ActivateSelected => app.activate_selected(DEFAULT_ACTION_ID),
+        Message::ActivateSelectedAction(action_id) => app.activate_selected(action_id),
+        Message::ResultSelected(index) => {
+            app.selected_index = Some(index);
+            app.focus_target = FocusTarget::Results;
+            Task::none()
+        }
+        Message::ResultActivated(index) => {
+            app.selected_index = Some(index);
+            app.focus_target = FocusTarget::Results;
+            app.activate_selected(DEFAULT_ACTION_ID)
+        }
+        Message::KeyPressed(key) => match app.focus_target {
+            FocusTarget::Search => app.handle_search_key(key),
+            FocusTarget::Results => app.handle_results_key(key),
+        },
+        Message::SearchFinished { request_id, result } => {
+            if request_id != app.active_search_request_id {
+                return Task::none();
+            }
+
+            match result {
+                Ok(results) => {
+                    app.error_message.clear();
+                    app.results = results;
+                    app.selected_index = (!app.results.is_empty()).then_some(0);
+
+                    if app.focus_target == FocusTarget::Results && !app.results.is_empty() {
+                        focus_first_result(&app.search_input_id)
+                    } else if app.results.is_empty() && app.focus_target == FocusTarget::Results {
+                        app.focus_target = FocusTarget::Search;
+                        focus(app.search_input_id.clone())
+                    } else {
+                        Task::none()
+                    }
+                }
+                Err(error_message) => {
+                    app.error_message = error_message;
+                    app.results.clear();
+                    app.selected_index = None;
+
+                    if app.focus_target == FocusTarget::Results {
+                        app.focus_target = FocusTarget::Search;
+                        focus(app.search_input_id.clone())
+                    } else {
+                        Task::none()
+                    }
+                }
+            }
+        }
+        Message::ActivationFinished(result) => match result {
+            Ok(ActivationOutcome::ClosePicker) => iced::exit(),
+            Ok(ActivationOutcome::RefreshResults) => app.request_search(),
+            Err(error_message) => {
+                app.error_message = error_message;
+                Task::none()
+            }
+        },
+    }
+}
+
+fn view(app: &PickerApp) -> Element<'_, Message> {
+    let search = text_input("Type to search", &app.query)
+        .id(app.search_input_id.clone())
+        .on_input(Message::QueryChanged)
+        .on_submit(Message::ActivateSelected)
+        .padding(12)
+        .size(24);
+
+    let results_list = if app.results.is_empty() {
+        column![text("No matches.")]
+            .spacing(8)
+            .width(Length::Fill)
+    } else {
+        app.results
+            .iter()
+            .enumerate()
+            .fold(column![].spacing(6).width(Length::Fill), |column, (index, result)| {
+                column.push(view_result_row(app, index, result))
+            })
+    };
+
+    let error = if app.error_message.is_empty() {
+        text("")
+    } else {
+        text(&app.error_message)
+    };
+
+    container(
+        column![
+            search,
+            text(format!("{} results", app.results.len())).size(14),
+            scrollable(results_list).height(Length::Fill),
+            error.size(14),
+        ]
+        .spacing(10)
+        .padding(18)
+        .width(Length::Fill)
+        .height(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+fn view_result_row<'a>(
+    app: &'a PickerApp,
+    index: usize,
+    result: &'a SearchResult,
+) -> Element<'a, Message> {
+    let is_selected = app.selected_index == Some(index);
+    let show_action_hints = is_selected && app.focus_target == FocusTarget::Results;
+
+    let title = if is_selected {
+        format!("> {}", result.title)
+    } else {
+        result.title.clone()
+    };
+
+    let mut text_column = column![text(title).size(18)].spacing(4);
+
+    if !result.subtitle.trim().is_empty() {
+        let subtitle_line = if let Some(icon_path) = subtitle_icon_path(result) {
+            row![
+                image(image::Handle::from_path(icon_path))
+                    .width(SUBTITLE_ICON_SIZE)
+                    .height(SUBTITLE_ICON_SIZE),
+                text(&result.subtitle).size(14)
+            ]
+            .spacing(6)
+        } else {
+            row![text(&result.subtitle).size(14)]
+        };
+
+        text_column = text_column.push(subtitle_line);
+    }
+
+    if show_action_hints && !result.actions.is_empty() {
+        text_column = text_column.push(text(format_action_hints(&result.actions)).size(13));
+    }
+
+    let row_content = row![leading_visual(result), text_column.width(Length::Fill)]
+        .spacing(10)
+        .width(Length::Fill);
+
+    mouse_area(
+        button(container(row_content).width(Length::Fill))
+            .width(Length::Fill)
+            .padding(10)
+            .on_press(Message::ResultSelected(index)),
+    )
+    .on_double_click(Message::ResultActivated(index))
+    .into()
 }
 
 impl PickerApp {
-    fn request_search(&self) {
-        self.worker
-            .sender()
-            .send(SearchWorkerInput::Search(self.query.clone()))
-            .unwrap();
+    fn request_search(&mut self) -> Task<Message> {
+        self.search_request_id += 1;
+        self.active_search_request_id = self.search_request_id;
+
+        let request_id = self.search_request_id;
+        let query = self.query.clone();
+        let registry = Arc::clone(&self.registry);
+
+        Task::perform(
+            async move { search_registry(registry, &query) },
+            move |result| Message::SearchFinished { request_id, result },
+        )
     }
 
-    fn apply_search_results(&mut self, result: Result<Vec<SearchResult>, String>) {
-        match result {
-            Ok(results) => {
-                self.error_message.clear();
-                {
-                    let mut rows = self.results.guard();
-                    rows.clear();
-                    for result in results {
-                        rows.push_back(result);
-                    }
-                }
-                self.selected_index = (!self.results.is_empty()).then_some(0);
-                self.sync_row_visibility();
-            }
-            Err(err) => {
-                self.error_message = err;
-                self.results.guard().clear();
-                self.selected_index = None;
-            }
-        }
-    }
+    fn activate_selected(&mut self, action_id: &'static str) -> Task<Message> {
+        let Some(result) = self.selected_result().cloned() else {
+            return Task::none();
+        };
 
-    fn sync_row_visibility(&mut self) {
-        let selected_index = self.selected_index;
-        let show_selected = self.focus_target == FocusTarget::Results;
-        let mut rows = self.results.guard();
-
-        for (index, row) in rows.iter_mut().enumerate() {
-            row.show_action_hints = show_selected && selected_index == Some(index);
-        }
-    }
-
-    fn move_selection(&mut self, offset: i32) {
-        if self.results.is_empty() {
-            self.selected_index = None;
-            return;
-        }
-
-        let current_index = self.selected_index.unwrap_or(0) as i32;
-        let next_index = (current_index + offset).clamp(0, self.results.len() as i32 - 1);
-        self.selected_index = Some(next_index as usize);
-        self.sync_row_visibility();
+        let registry = Arc::clone(&self.registry);
+        Task::perform(
+            async move { activate_result(registry, result, action_id) },
+            Message::ActivationFinished,
+        )
     }
 
     fn selected_result(&self) -> Option<&SearchResult> {
-        self.selected_index
-            .and_then(|index| self.results.get(index))
-            .map(|row| &row.result)
+        self.selected_index.and_then(|index| self.results.get(index))
     }
 
-    fn selected_action_id_for_shortcut(&self, key: gdk::Key) -> Option<&'static str> {
-        let shortcut = key.to_unicode()?.to_ascii_lowercase();
+    fn handle_search_key(&mut self, key: AppKey) -> Task<Message> {
+        match key {
+            AppKey::Down if !self.results.is_empty() => {
+                self.focus_target = FocusTarget::Results;
+                self.selected_index = Some(0);
+                focus_first_result(&self.search_input_id)
+            }
+            AppKey::Escape => iced::exit(),
+            _ => Task::none(),
+        }
+    }
+
+    fn handle_results_key(&mut self, key: AppKey) -> Task<Message> {
+        match key {
+            AppKey::Down => {
+                let Some(index) = self.selected_index else {
+                    self.selected_index = (!self.results.is_empty()).then_some(0);
+                    return if self.results.is_empty() {
+                        Task::none()
+                    } else {
+                        focus_first_result(&self.search_input_id)
+                    };
+                };
+
+                if index + 1 < self.results.len() {
+                    self.selected_index = Some(index + 1);
+                    focus_next()
+                } else {
+                    Task::none()
+                }
+            }
+            AppKey::Up => match self.selected_index {
+                Some(0) | None => {
+                    self.focus_target = FocusTarget::Search;
+                    focus(self.search_input_id.clone())
+                }
+                Some(index) => {
+                    self.selected_index = Some(index - 1);
+                    focus_previous()
+                }
+            },
+            AppKey::Enter => self.activate_selected(DEFAULT_ACTION_ID),
+            AppKey::Escape => iced::exit(),
+            AppKey::Shortcut(shortcut) => self
+                .selected_action_id_for_shortcut(shortcut)
+                .map_or_else(Task::none, |action_id| {
+                    Task::done(Message::ActivateSelectedAction(action_id))
+                }),
+        }
+    }
+
+    fn selected_action_id_for_shortcut(&self, shortcut: char) -> Option<&'static str> {
+        let shortcut = shortcut.to_ascii_lowercase();
 
         self.selected_result()?
             .actions
@@ -264,475 +428,91 @@ impl PickerApp {
             .find(|action| action.shortcut.to_ascii_lowercase() == shortcut)
             .map(|action| action.id)
     }
-
-    fn activate_selected(&mut self, action_id: &'static str) {
-        let Some(result) = self.selected_result().cloned() else {
-            return;
-        };
-
-        self.worker
-            .sender()
-            .send(SearchWorkerInput::Activate { result, action_id })
-            .unwrap();
-    }
 }
 
-struct SearchWorker {
-    registry: ModuleRegistry,
+fn focus_first_result(search_input_id: &Id) -> Task<Message> {
+    Task::batch([
+        focus(search_input_id.clone()),
+        focus_next(),
+    ])
 }
 
-impl Worker for SearchWorker {
-    type Init = ();
-    type Input = SearchWorkerInput;
-    type Output = AppMsg;
-
-    fn init(_init: Self::Init, _sender: relm4::ComponentSender<Self>) -> Self {
-        Self {
-            registry: ModuleRegistry::new(modules::default_modules()),
-        }
-    }
-
-    fn update(&mut self, message: Self::Input, sender: relm4::ComponentSender<Self>) {
-        match message {
-            SearchWorkerInput::Search(query) => {
-                let result = self.registry.search(&query).map_err(|err| err.to_string());
-                sender
-                    .output(AppMsg::SearchFinished { query, result })
-                    .unwrap();
-            }
-            SearchWorkerInput::Activate { result, action_id } => {
-                let outcome = if action_id == DEFAULT_ACTION_ID {
-                    self.registry.activate(&result)
-                } else {
-                    self.registry.activate_action(&result, action_id)
-                }
-                .map_err(|err| err.to_string());
-
-                sender.output(AppMsg::ActivationFinished(outcome)).unwrap();
-            }
-        }
-    }
+fn search_registry(
+    registry: Arc<Mutex<ModuleRegistry>>,
+    query: &str,
+) -> Result<Vec<SearchResult>, String> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| "module registry lock poisoned".to_string())?;
+    registry.search(query).map_err(|error| error.to_string())
 }
 
-impl Component for PickerApp {
-    type CommandOutput = ();
-    type Init = ();
-    type Input = AppMsg;
-    type Output = ();
-    type Root = ApplicationWindow;
-    type Widgets = PickerWidgets;
+fn activate_result(
+    registry: Arc<Mutex<ModuleRegistry>>,
+    result: SearchResult,
+    action_id: &'static str,
+) -> Result<ActivationOutcome, String> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| "module registry lock poisoned".to_string())?;
 
-    fn init_root() -> Self::Root {
-        ApplicationWindow::builder()
-            .title("picky")
-            .default_width(WINDOW_WIDTH)
-            .default_height(680)
-            .decorated(false)
-            .resizable(false)
-            .build()
-    }
-
-    fn init(
-        _init: Self::Init,
-        root: Self::Root,
-        sender: relm4::ComponentSender<Self>,
-    ) -> relm4::ComponentParts<Self> {
-        let container = GtkBox::new(Orientation::Vertical, 10);
-        container.set_margin_top(18);
-        container.set_margin_bottom(18);
-        container.set_margin_start(18);
-        container.set_margin_end(18);
-
-        let search_entry = Entry::new();
-        search_entry.set_hexpand(true);
-        search_entry.set_placeholder_text(Some("Type to search"));
-
-        let results_label = Label::new(None);
-        results_label.set_halign(gtk::Align::Start);
-
-        let results: FactoryVecDeque<ResultRow> =
-            FactoryVecDeque::builder().launch_default().detach();
-        let list_box = results.widget().clone();
-        list_box.set_selection_mode(SelectionMode::Single);
-        list_box.add_css_class("boxed-list");
-        list_box.set_hexpand(true);
-        list_box.set_focusable(true);
-
-        let empty_label = Label::new(Some("No matches."));
-        empty_label.set_halign(gtk::Align::Start);
-        empty_label.set_xalign(0.0);
-        empty_label.set_margin_top(8);
-        empty_label.set_margin_bottom(8);
-        empty_label.set_margin_start(8);
-        empty_label.set_margin_end(8);
-
-        let results_stack = Stack::new();
-        results_stack.add_named(&list_box, Some(RESULTS_STACK_RESULTS));
-        results_stack.add_named(&empty_label, Some(RESULTS_STACK_EMPTY));
-
-        let scroller = ScrolledWindow::builder()
-            .hscrollbar_policy(PolicyType::Never)
-            .vexpand(true)
-            .child(&results_stack)
-            .build();
-        scroller.set_min_content_width(WINDOW_CONTENT_WIDTH);
-        scroller.set_max_content_width(WINDOW_CONTENT_WIDTH);
-        scroller.set_propagate_natural_width(false);
-
-        let error_label = Label::new(None);
-        error_label.set_halign(gtk::Align::Start);
-        error_label.add_css_class("error");
-
-        container.append(&search_entry);
-        container.append(&results_label);
-        container.append(&scroller);
-        container.append(&error_label);
-        root.set_child(Some(&container));
-
-        let worker = SearchWorker::builder()
-            .detach_worker(())
-            .forward(sender.input_sender(), identity);
-
-        let model = PickerApp {
-            worker,
-            results,
-            query: String::new(),
-            error_message: String::new(),
-            selected_index: None,
-            focus_target: FocusTarget::Search,
-        };
-
-        {
-            let input = sender.input_sender().clone();
-            search_entry.connect_changed(move |entry| {
-                let _ = input.send(AppMsg::QueryChanged(entry.text().to_string()));
-            });
-        }
-
-        {
-            let input = sender.input_sender().clone();
-            search_entry.connect_activate(move |_| {
-                let _ = input.send(AppMsg::ActivateSelected);
-            });
-        }
-
-        {
-            let input = sender.input_sender().clone();
-            let key_controller = EventControllerKey::new();
-            key_controller.connect_key_pressed(move |_, key, _, _| {
-                if key == gdk::Key::Down {
-                    let _ = input.send(AppMsg::SearchEntryKeyPressed(key));
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
-                }
-            });
-            search_entry.add_controller(key_controller);
-        }
-
-        {
-            let input = sender.input_sender().clone();
-            list_box.connect_row_activated(move |_, row: &gtk::ListBoxRow| {
-                let _ = input.send(AppMsg::ResultsRowActivated(row.index()));
-            });
-        }
-
-        {
-            let input = sender.input_sender().clone();
-            list_box.connect_row_selected(move |_, row: Option<&gtk::ListBoxRow>| {
-                let _ = input.send(AppMsg::RowSelected(row.map(|row| row.index())));
-            });
-        }
-
-        {
-            let input = sender.input_sender().clone();
-            let key_controller = EventControllerKey::new();
-            key_controller.connect_key_pressed(move |_, key, _, _| {
-                if matches!(
-                    key,
-                    gdk::Key::Down | gdk::Key::Up | gdk::Key::Return | gdk::Key::KP_Enter
-                ) || key.to_unicode().is_some()
-                {
-                    let _ = input.send(AppMsg::ResultsKeyPressed(key));
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
-                }
-            });
-            list_box.add_controller(key_controller);
-        }
-
-        {
-            let input = sender.input_sender().clone();
-            let key_controller = EventControllerKey::new();
-            key_controller.connect_key_pressed(move |_, key, _, _| {
-                if key == gdk::Key::Escape {
-                    let _ = input.send(AppMsg::Close);
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
-                }
-            });
-            root.add_controller(key_controller);
-        }
-
-        let widgets = PickerWidgets {
-            search_entry,
-            results_label,
-            results_stack,
-            list_box,
-            error_label,
-        };
-
-        sync_view(&model, &widgets);
-        model.request_search();
-
-        root.connect_realize(|window| {
-            resize_window_for_monitor(window);
-        });
-
-        glib::idle_add_local_once({
-            let search_entry = widgets.search_entry.clone();
-            move || {
-                search_entry.grab_focus();
-            }
-        });
-
-        relm4::ComponentParts { model, widgets }
-    }
-
-    fn update(
-        &mut self,
-        message: Self::Input,
-        _sender: relm4::ComponentSender<Self>,
-        root: &Self::Root,
-    ) {
-        match message {
-            AppMsg::QueryChanged(query) => {
-                self.query = query;
-                self.focus_target = FocusTarget::Search;
-                self.sync_row_visibility();
-                self.request_search();
-            }
-            AppMsg::SearchEntryKeyPressed(key) => {
-                if key == gdk::Key::Down && !self.results.is_empty() {
-                    self.focus_target = FocusTarget::Results;
-                    if self.selected_index.is_none() {
-                        self.selected_index = Some(0);
-                    }
-                    self.sync_row_visibility();
-                }
-            }
-            AppMsg::ResultsKeyPressed(key) => match key {
-                gdk::Key::Down => {
-                    self.focus_target = FocusTarget::Results;
-                    self.move_selection(1);
-                }
-                gdk::Key::Up => {
-                    if self.selected_index.unwrap_or(0) == 0 {
-                        self.focus_target = FocusTarget::Search;
-                        self.sync_row_visibility();
-                    } else {
-                        self.focus_target = FocusTarget::Results;
-                        self.move_selection(-1);
-                    }
-                }
-                gdk::Key::Return | gdk::Key::KP_Enter => {
-                    self.activate_selected(DEFAULT_ACTION_ID);
-                }
-                _ => {
-                    if let Some(action_id) = self.selected_action_id_for_shortcut(key) {
-                        self.activate_selected(action_id);
-                    }
-                }
-            },
-            AppMsg::ResultsRowActivated(row_index) => {
-                if row_index >= 0 {
-                    self.selected_index = Some(row_index as usize);
-                    self.focus_target = FocusTarget::Results;
-                    self.sync_row_visibility();
-                    self.activate_selected(DEFAULT_ACTION_ID);
-                }
-            }
-            AppMsg::RowSelected(row_index) => {
-                self.selected_index = row_index.map(|row_index| row_index as usize);
-                self.sync_row_visibility();
-            }
-            AppMsg::ActivateSelected => {
-                self.activate_selected(DEFAULT_ACTION_ID);
-            }
-            AppMsg::SearchFinished { query, result } => {
-                if query == self.query {
-                    self.apply_search_results(result);
-                }
-            }
-            AppMsg::ActivationFinished(result) => match result {
-                Ok(ActivationOutcome::ClosePicker) => root.close(),
-                Ok(ActivationOutcome::RefreshResults) => self.request_search(),
-                Err(err) => {
-                    self.error_message = err;
-                }
-            },
-            AppMsg::Close => root.close(),
-        }
-    }
-
-    fn update_view(&self, widgets: &mut Self::Widgets, _sender: relm4::ComponentSender<Self>) {
-        sync_view(self, widgets);
-    }
-}
-
-fn sync_view(model: &PickerApp, widgets: &PickerWidgets) {
-    if widgets.search_entry.text().as_str() != model.query {
-        widgets.search_entry.set_text(&model.query);
-    }
-
-    widgets
-        .results_label
-        .set_text(&format!("{} results", model.results.len()));
-    widgets.error_label.set_text(&model.error_message);
-    widgets
-        .results_stack
-        .set_visible_child_name(if model.results.is_empty() {
-            RESULTS_STACK_EMPTY
-        } else {
-            RESULTS_STACK_RESULTS
-        });
-
-    if model.results.is_empty() {
-        widgets.list_box.unselect_all();
-    } else if let Some(selected_index) = model.selected_index {
-        if let Some(row) = widgets.list_box.row_at_index(selected_index as i32) {
-            widgets.list_box.select_row(Some(&row));
-        }
-    }
-
-    match model.focus_target {
-        FocusTarget::Search => {
-            widgets.search_entry.grab_focus_without_selecting();
-        }
-        FocusTarget::Results if !model.results.is_empty() => {
-            if let Some(selected_index) = model.selected_index {
-                if let Some(row) = widgets.list_box.row_at_index(selected_index as i32) {
-                    widgets.list_box.select_row(Some(&row));
-                    row.grab_focus();
-                }
-            }
-        }
-        FocusTarget::Results => {
-            widgets.search_entry.grab_focus();
-        }
-    }
-}
-
-fn resize_window_for_monitor(window: &ApplicationWindow) {
-    let Some(surface) = window.surface() else {
-        return;
-    };
-    let display = surface.display();
-    let Some(monitor) = display.monitor_at_surface(&surface) else {
-        return;
-    };
-
-    let target_height =
-        ((monitor.geometry().height() as f64) * WINDOW_HEIGHT_FRACTION).round() as i32;
-    window.set_default_size(WINDOW_WIDTH, target_height.max(360));
-}
-
-fn row_title(result: &SearchResult) -> String {
-    let prefix = match result.kind {
-        MatchKind::Application if application_icon_available(result.icon_name.as_deref()) => "",
-        MatchKind::Application => "📦 ",
-        MatchKind::Notification | MatchKind::Window | MatchKind::Workspace => "",
-    };
-
-    format!("{prefix}{}", result.title)
-}
-
-fn configure_leading_widgets(result: &SearchResult, icon: &Image, symbol: &Label) {
-    icon.set_visible(false);
-    symbol.set_visible(false);
-
-    match result.kind {
-        MatchKind::Application => {
-            if configure_application_image(icon, result.icon_name.as_deref(), RESULT_ICON_SIZE) {
-                icon.set_visible(true);
-            }
-        }
-        MatchKind::Notification => {
-            symbol.set_label("🔔");
-            symbol.set_visible(true);
-        }
-        MatchKind::Window => {
-            symbol.set_label("🗖");
-            symbol.set_visible(true);
-        }
-        MatchKind::Workspace => {
-            symbol.set_label("🖥️");
-            symbol.set_visible(true);
-        }
-    }
-}
-
-fn configure_subtitle_icon(result: &SearchResult, subtitle_icon: &Image) {
-    subtitle_icon.set_visible(false);
-
-    if result.kind == MatchKind::Window
-        && configure_application_image(
-            subtitle_icon,
-            result.icon_name.as_deref(),
-            SUBTITLE_ICON_SIZE,
-        )
-    {
-        subtitle_icon.set_visible(true);
-    }
-}
-
-fn application_icon_available(icon_name: Option<&str>) -> bool {
-    let icon_name = match icon_name
-        .map(str::trim)
-        .filter(|icon_name| !icon_name.is_empty())
-    {
-        Some(icon_name) => icon_name,
-        None => return false,
-    };
-
-    if Path::new(icon_name).is_absolute() {
-        return Path::new(icon_name).is_file();
-    }
-
-    let Some(display) = gdk::Display::default() else {
-        return false;
-    };
-    let icon_theme = gtk::IconTheme::for_display(&display);
-    icon_theme.has_icon(icon_name)
-}
-
-fn configure_application_image(image: &Image, icon_name: Option<&str>, size: i32) -> bool {
-    let icon_name = match icon_name
-        .map(str::trim)
-        .filter(|icon_name| !icon_name.is_empty())
-    {
-        Some(icon_name) => icon_name,
-        None => return false,
-    };
-
-    if Path::new(icon_name).is_absolute() && Path::new(icon_name).is_file() {
-        image.set_from_file(Some(icon_name));
+    if action_id == DEFAULT_ACTION_ID {
+        registry.activate(&result)
     } else {
-        let Some(display) = gdk::Display::default() else {
-            return false;
-        };
-        let icon_theme = gtk::IconTheme::for_display(&display);
-        if !icon_theme.has_icon(icon_name) {
-            return false;
-        }
-        image.set_icon_name(Some(icon_name));
+        registry.activate_action(&result, action_id)
     }
+    .map_err(|error| error.to_string())
+}
 
-    image.set_pixel_size(size);
-    image.set_valign(gtk::Align::Start);
-    true
+fn leading_visual<'a>(result: &'a SearchResult) -> Element<'a, Message> {
+    if let Some(icon_path) = leading_icon_path(result) {
+        image(image::Handle::from_path(icon_path))
+            .width(RESULT_ICON_SIZE)
+            .height(RESULT_ICON_SIZE)
+            .into()
+    } else {
+        text(kind_symbol(result))
+            .size(24)
+            .width(Length::Fixed(RESULT_ICON_SIZE))
+            .into()
+    }
+}
+
+fn leading_icon_path(result: &SearchResult) -> Option<PathBuf> {
+    match result.kind {
+        MatchKind::Application => icon_file_path(result.icon_name.as_deref()),
+        MatchKind::Notification | MatchKind::Window | MatchKind::Workspace => None,
+    }
+}
+
+fn subtitle_icon_path(result: &SearchResult) -> Option<PathBuf> {
+    if result.kind == MatchKind::Window {
+        icon_file_path(result.icon_name.as_deref())
+    } else {
+        None
+    }
+}
+
+fn icon_file_path(icon_name: Option<&str>) -> Option<PathBuf> {
+    let icon_name = icon_name
+        .map(str::trim)
+        .filter(|icon_name| !icon_name.is_empty())?;
+    let path = Path::new(icon_name);
+
+    if path.is_absolute() && path.is_file() {
+        Some(path.to_path_buf())
+    } else {
+        None
+    }
+}
+
+fn kind_symbol(result: &SearchResult) -> &'static str {
+    match result.kind {
+        MatchKind::Application => "📦",
+        MatchKind::Notification => "🔔",
+        MatchKind::Window => "🗖",
+        MatchKind::Workspace => "🖥",
+    }
 }
 
 fn format_action_hints(actions: &[ResultAction]) -> String {
@@ -741,4 +521,50 @@ fn format_action_hints(actions: &[ResultAction]) -> String {
         .map(|action| format!("{} - {}", action.shortcut, action.label))
         .collect::<Vec<_>>()
         .join("   ")
+}
+
+fn initial_window_height() -> f32 {
+    focused_output_height()
+        .map(|height| ((height as f32) * WINDOW_HEIGHT_FRACTION).round().max(360.0))
+        .unwrap_or(DEFAULT_WINDOW_HEIGHT)
+}
+
+fn focused_output_height() -> Option<i32> {
+    let focused_output = load_focused_output_name()?;
+    let outputs = load_outputs().ok()?;
+
+    outputs
+        .get(&focused_output)
+        .map(|output| output.logical.height)
+        .or_else(|| outputs.values().next().map(|output| output.logical.height))
+}
+
+fn load_focused_output_name() -> Option<String> {
+    let workspaces = Command::new("niri")
+        .args(["msg", "--json", "workspaces"])
+        .output()
+        .ok()?;
+
+    if !workspaces.status.success() {
+        return None;
+    }
+
+    let workspaces: Vec<NiriWorkspaceInfo> = serde_json::from_slice(&workspaces.stdout).ok()?;
+    workspaces
+        .into_iter()
+        .find(|workspace| workspace.is_focused)
+        .map(|workspace| workspace.output)
+}
+
+fn load_outputs() -> Result<HashMap<String, NiriOutput>, serde_json::Error> {
+    let outputs = Command::new("niri")
+        .args(["msg", "--json", "outputs"])
+        .output()
+        .map_err(serde_json::Error::io)?;
+
+    if !outputs.status.success() {
+        return Ok(HashMap::new());
+    }
+
+    serde_json::from_slice(&outputs.stdout)
 }
