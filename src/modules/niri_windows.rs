@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -11,6 +13,10 @@ use crate::module::{
 
 const MODULE_KEY: &str = "niri-windows";
 const CLOSE_ACTION_ID: &str = "close";
+const TERMINATE_ACTION_ID: &str = "terminate";
+const KILL_ACTION_ID: &str = "kill";
+const CLOSE_POLL_TIMEOUT: Duration = Duration::from_millis(750);
+const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct NiriWindowsModule {
     icon_index: HashMap<String, String>,
@@ -23,6 +29,7 @@ struct NiriWindow {
     title: String,
     #[serde(default)]
     app_id: String,
+    pid: Option<u32>,
     workspace_id: u64,
 }
 
@@ -90,16 +97,28 @@ impl Module for NiriWindowsModule {
 
                 Some(SearchResult {
                     module_key: MODULE_KEY,
-                    item_id: window.id.to_string(),
+                    item_id: encode_window_target(window.id, window.pid),
                     title: window.title,
                     subtitle,
                     icon_name: icon_name_for_app_id(&self.icon_index, &window.app_id),
                     kind: MatchKind::Window,
-                    actions: vec![ResultAction {
-                        id: CLOSE_ACTION_ID,
-                        label: "close",
-                        shortcut: 'q',
-                    }],
+                    actions: vec![
+                        ResultAction {
+                            id: CLOSE_ACTION_ID,
+                            label: "close",
+                            shortcut: 'q',
+                        },
+                        ResultAction {
+                            id: TERMINATE_ACTION_ID,
+                            label: "terminate",
+                            shortcut: 't',
+                        },
+                        ResultAction {
+                            id: KILL_ACTION_ID,
+                            label: "kill",
+                            shortcut: 'k',
+                        },
+                    ],
                     score,
                 })
             })
@@ -116,48 +135,133 @@ impl Module for NiriWindowsModule {
     }
 
     fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome> {
+        let target = parse_window_target(item_id)?;
+
         match action_id {
             DEFAULT_ACTION_ID => {
-                focus_window(item_id)?;
+                focus_window(target.window_id)?;
+                Ok(ActivationOutcome::ClosePicker)
             }
             CLOSE_ACTION_ID => {
-                focus_window(item_id)?;
-                close_focused_window()?;
+                close_window(target.window_id)?;
+                wait_for_close_or_focus(target.window_id)
+            }
+            TERMINATE_ACTION_ID => {
+                signal_window_process(target.pid, "TERM")?;
+                Ok(ActivationOutcome::ClosePicker)
+            }
+            KILL_ACTION_ID => {
+                signal_window_process(target.pid, "KILL")?;
+                Ok(ActivationOutcome::ClosePicker)
             }
             _ => anyhow::bail!("unknown window action: {action_id}"),
         }
-
-        Ok(ActivationOutcome::ClosePicker)
     }
 }
 
-fn focus_window(item_id: &str) -> Result<()> {
+#[derive(Clone, Copy, Debug)]
+struct WindowTarget<'a> {
+    window_id: &'a str,
+    pid: Option<u32>,
+}
+
+fn encode_window_target(window_id: u64, pid: Option<u32>) -> String {
+    match pid {
+        Some(pid) => format!("{window_id}:{pid}"),
+        None => window_id.to_string(),
+    }
+}
+
+fn parse_window_target(item_id: &str) -> Result<WindowTarget<'_>> {
+    if let Some((window_id, pid)) = item_id.split_once(':') {
+        let pid = pid
+            .parse::<u32>()
+            .with_context(|| format!("invalid window pid in item id: {item_id}"))?;
+
+        Ok(WindowTarget {
+            window_id,
+            pid: Some(pid),
+        })
+    } else {
+        Ok(WindowTarget {
+            window_id: item_id,
+            pid: None,
+        })
+    }
+}
+
+fn focus_window(window_id: &str) -> Result<()> {
     let status = Command::new("niri")
-        .args(["msg", "action", "focus-window", "--id", item_id])
+        .args(["msg", "action", "focus-window", "--id", window_id])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .with_context(|| format!("failed to focus niri window {item_id}"))?;
+        .with_context(|| format!("failed to focus niri window {window_id}"))?;
 
     if !status.success() {
-        bail!("niri refused to focus window {item_id}");
+        bail!("niri refused to focus window {window_id}");
     }
 
     Ok(())
 }
 
-fn close_focused_window() -> Result<()> {
+fn close_window(window_id: &str) -> Result<()> {
     let status = Command::new("niri")
-        .args(["msg", "action", "close-window"])
+        .args(["msg", "action", "close-window", "--id", window_id])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .context("failed to close focused niri window")?;
+        .with_context(|| format!("failed to close niri window {window_id}"))?;
 
     if !status.success() {
-        bail!("niri refused to close the focused window");
+        bail!("niri refused to close window {window_id}");
+    }
+
+    Ok(())
+}
+
+fn wait_for_close_or_focus(window_id: &str) -> Result<ActivationOutcome> {
+    let deadline = Instant::now() + CLOSE_POLL_TIMEOUT;
+
+    while Instant::now() < deadline {
+        if !window_exists(window_id)? {
+            return Ok(ActivationOutcome::RefreshResults);
+        }
+
+        thread::sleep(CLOSE_POLL_INTERVAL);
+    }
+
+    if window_exists(window_id)? {
+        focus_window(window_id)?;
+        Ok(ActivationOutcome::ClosePicker)
+    } else {
+        Ok(ActivationOutcome::RefreshResults)
+    }
+}
+
+fn window_exists(window_id: &str) -> Result<bool> {
+    Ok(load_windows()?
+        .into_iter()
+        .any(|window| window.id.to_string() == window_id))
+}
+
+fn signal_window_process(pid: Option<u32>, signal: &str) -> Result<()> {
+    let Some(pid) = pid else {
+        bail!("window has no process id available");
+    };
+
+    let status = Command::new("kill")
+        .args([format!("-{signal}"), pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to send SIG{signal} to process {pid}"))?;
+
+    if !status.success() {
+        bail!("kill refused to send SIG{signal} to process {pid}");
     }
 
     Ok(())
