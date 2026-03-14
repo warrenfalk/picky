@@ -332,6 +332,7 @@ fn build_row(
         Some(MatchKind::Notification) if leading_widget.is_none() => "🔔 ",
         Some(MatchKind::Notification) => "",
         Some(MatchKind::Window) => "",
+        Some(MatchKind::Workspace) => "",
         None => "",
     };
 
@@ -379,6 +380,7 @@ fn build_leading_widget(kind: Option<MatchKind>, icon_name: Option<&str>) -> Opt
             .map(|image| image.upcast::<gtk::Widget>()),
         Some(MatchKind::Window) => Some(build_symbol_label("🗖").upcast::<gtk::Widget>()),
         Some(MatchKind::Notification) => Some(build_symbol_label("🔔").upcast::<gtk::Widget>()),
+        Some(MatchKind::Workspace) => Some(build_symbol_label("🖥️").upcast::<gtk::Widget>()),
         None => None,
     }
 }

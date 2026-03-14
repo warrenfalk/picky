@@ -13,6 +13,7 @@ pub enum MatchKind {
     Application,
     Notification,
     Window,
+    Workspace,
 }
 
 #[derive(Clone, Debug)]
