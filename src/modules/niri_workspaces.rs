@@ -1,10 +1,10 @@
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::fuzzy;
-use crate::module::{ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, SearchResult};
+use crate::module::{ActivationOutcome, MatchKind, Module, SearchResult, DEFAULT_ACTION_ID};
 
 const MODULE_KEY: &str = "niri-workspaces";
 

@@ -41,7 +41,8 @@ pub fn score(query: &str, haystack: &str) -> Option<i64> {
         return Some(0);
     }
 
-    terms.into_iter()
+    terms
+        .into_iter()
         .map(|term| score_term(&term, haystack).map(|term_match| term_match.score))
         .sum()
 }
@@ -158,7 +159,10 @@ mod tests {
     #[test]
     fn all_terms_must_match_some_field() {
         assert!(score_fields("fire dp-3", &[("Firefox", 0), ("DP-3", 0)]).is_some());
-        assert_eq!(score_fields("fire dp-4", &[("Firefox", 0), ("DP-3", 0)]), None);
+        assert_eq!(
+            score_fields("fire dp-4", &[("Firefox", 0), ("DP-3", 0)]),
+            None
+        );
     }
 
     #[test]

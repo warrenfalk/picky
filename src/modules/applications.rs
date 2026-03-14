@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 
 use crate::fuzzy;
-use crate::module::{ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, SearchResult};
+use crate::module::{ActivationOutcome, MatchKind, Module, SearchResult, DEFAULT_ACTION_ID};
 
 const MODULE_KEY: &str = "applications";
 
@@ -50,7 +50,9 @@ pub fn load_icon_index() -> Result<HashMap<String, String>> {
 }
 
 fn insert_icon_aliases(icons: &mut HashMap<String, String>, desktop_id: &str, icon_name: &str) {
-    icons.entry(desktop_id.to_string()).or_insert_with(|| icon_name.to_string());
+    icons
+        .entry(desktop_id.to_string())
+        .or_insert_with(|| icon_name.to_string());
 
     if let Some(stripped) = desktop_id.strip_suffix(".desktop") {
         icons

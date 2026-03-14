@@ -1,12 +1,12 @@
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::fuzzy;
 use crate::module::{
-    ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, ResultAction, SearchResult,
+    ActivationOutcome, MatchKind, Module, ResultAction, SearchResult, DEFAULT_ACTION_ID,
 };
 
 const MODULE_KEY: &str = "mako-notifications";

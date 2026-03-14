@@ -1,3 +1,4 @@
+mod app;
 mod fuzzy;
 mod launcher;
 mod module;

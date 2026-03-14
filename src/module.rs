@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 pub const DEFAULT_ACTION_ID: &str = "default";
 
@@ -36,7 +36,7 @@ pub struct SearchResult {
     pub score: i64,
 }
 
-pub trait Module {
+pub trait Module: Send {
     fn key(&self) -> &'static str;
     fn search(&mut self, query: &str) -> Result<Vec<SearchResult>>;
     fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome>;
