@@ -5,9 +5,12 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::fuzzy;
-use crate::module::{ActivationOutcome, MatchKind, Module, SearchResult, DEFAULT_ACTION_ID};
+use crate::module::{
+    ActivationOutcome, MatchKind, Module, ResultAction, SearchResult, DEFAULT_ACTION_ID,
+};
 
 const MODULE_KEY: &str = "niri-windows";
+const CLOSE_ACTION_ID: &str = "close";
 
 pub struct NiriWindowsModule {
     icon_index: HashMap<String, String>,
@@ -92,7 +95,11 @@ impl Module for NiriWindowsModule {
                     subtitle,
                     icon_name: icon_name_for_app_id(&self.icon_index, &window.app_id),
                     kind: MatchKind::Window,
-                    actions: Vec::new(),
+                    actions: vec![ResultAction {
+                        id: CLOSE_ACTION_ID,
+                        label: "close",
+                        shortcut: 'q',
+                    }],
                     score,
                 })
             })
@@ -109,24 +116,51 @@ impl Module for NiriWindowsModule {
     }
 
     fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome> {
-        if action_id != DEFAULT_ACTION_ID {
-            anyhow::bail!("unknown window action: {action_id}");
-        }
-
-        let status = Command::new("niri")
-            .args(["msg", "action", "focus-window", "--id", item_id])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .with_context(|| format!("failed to focus niri window {item_id}"))?;
-
-        if !status.success() {
-            bail!("niri refused to focus window {item_id}");
+        match action_id {
+            DEFAULT_ACTION_ID => {
+                focus_window(item_id)?;
+            }
+            CLOSE_ACTION_ID => {
+                focus_window(item_id)?;
+                close_focused_window()?;
+            }
+            _ => anyhow::bail!("unknown window action: {action_id}"),
         }
 
         Ok(ActivationOutcome::ClosePicker)
     }
+}
+
+fn focus_window(item_id: &str) -> Result<()> {
+    let status = Command::new("niri")
+        .args(["msg", "action", "focus-window", "--id", item_id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to focus niri window {item_id}"))?;
+
+    if !status.success() {
+        bail!("niri refused to focus window {item_id}");
+    }
+
+    Ok(())
+}
+
+fn close_focused_window() -> Result<()> {
+    let status = Command::new("niri")
+        .args(["msg", "action", "close-window"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to close focused niri window")?;
+
+    if !status.success() {
+        bail!("niri refused to close the focused window");
+    }
+
+    Ok(())
 }
 
 fn load_windows() -> Result<Vec<NiriWindow>> {
