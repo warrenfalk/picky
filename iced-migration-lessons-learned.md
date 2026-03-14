@@ -12,3 +12,10 @@
 - The first pass also assumed convenience helpers like `keyboard::on_key_press` and `text_input::focus`. In the installed crate, the working APIs are `event::listen_with(...)` for filtered key handling and `iced::widget::operation::{focus, focus_next, focus_previous}` for focus changes. The guide warns that helper names drift, but it would be stronger if it explicitly advised checking the installed crate source for input and focus helpers before wiring keyboard-heavy UIs.
 - Widget IDs are generic `iced::widget::Id` values, not widget-specific `text_input::Id` values in this version. That matters for any migration that depends on programmatic focus.
 - The builder also rejected an inline `.theme(|_| Theme::Dark)` closure because the trait bound in this version expects a more general function shape. Replacing it with a named `fn theme(&PickerApp) -> Theme` solved it. That is a minor issue, but it is another example of why compilation against the installed crate matters more than relying on broad architectural guidance alone.
+
+## List Performance
+
+- The naive Iced port rebuilt the full result list with a plain `column` on every state update, and the performance was noticeably bad in practice. `iced-best-practices.md` talks correctly about state ownership and explicit effects, but it does not warn that straightforward declarative list rebuilding can still be too expensive for picker-style UIs with frequent updates.
+- Iced `0.14` does not appear to expose a general built-in virtual list widget for ordinary app code. The useful built-ins here were `keyed_column` for identity continuity and `lazy(...)` for rebuild avoidance, not true virtualization.
+- Converting the results view to `keyed_column + lazy` materially improved responsiveness for this app. That is an important practical middle step before attempting custom windowing or a bespoke widget.
+- The distinction matters: `lazy` reduces rebuilding, but it does not virtualize the list. If a picker still performs poorly after keyed/lazy rows, the next step is probably a manual visible-range implementation driven by `Scrollable::on_scroll`, not more generic “reactive” cleanup.
