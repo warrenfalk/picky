@@ -11,7 +11,7 @@ use iced::widget::{
     Id, button, column, container, image, keyed_column, lazy, mouse_area, row, scrollable, text,
     text_input,
 };
-use iced::widget::operation::{focus, focus_next, focus_previous};
+use iced::widget::operation::{focus, focus_next};
 use iced::{Background, Element, Length, Size, Subscription, Task, Theme, border, window};
 use serde::Deserialize;
 
@@ -458,7 +458,7 @@ impl PickerApp {
 
                 if index + 1 < self.results.len() {
                     self.selected_index = Some(index + 1);
-                    focus_next()
+                    Task::none()
                 } else {
                     Task::none()
                 }
@@ -470,7 +470,7 @@ impl PickerApp {
                 }
                 Some(index) => {
                     self.selected_index = Some(index - 1);
-                    focus_previous()
+                    Task::none()
                 }
             },
             AppKey::Enter => self.activate_selected(DEFAULT_ACTION_ID),
