@@ -266,6 +266,7 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
             .enumerate()
             .map(|(index, result)| {
                 let row = ResultRowView {
+                    index,
                     result: result.clone(),
                     is_selected: app.selected_index == Some(index),
                     show_action_hints: app.selected_index == Some(index)
@@ -274,7 +275,7 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
 
                 (
                     row_key(&row.result),
-                    lazy(row, move |row| view_result_row(index, row)).into(),
+                    lazy(row, view_result_row).into(),
                 )
             })
             .collect::<Vec<_>>();
@@ -307,15 +308,14 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ResultRowView {
+    index: usize,
     result: SearchResult,
     is_selected: bool,
     show_action_hints: bool,
 }
 
-fn view_result_row(
-    index: usize,
-    row_state: &ResultRowView,
-) -> Element<'static, Message> {
+fn view_result_row(row_state: &ResultRowView) -> Element<'static, Message> {
+    let index = row_state.index;
     let is_selected = row_state.is_selected;
     let show_action_hints = row_state.show_action_hints;
     let result = &row_state.result;
