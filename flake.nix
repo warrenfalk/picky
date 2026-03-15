@@ -66,12 +66,15 @@
 
           packages = with pkgs; [
             firefox
+            grim
             rustToolchain
             rust-analyzer
             pkg-config
             gtk3
             gtk4
             niri
+            wtype
+            ydotool
           ] ++ runtimeLibs;
 
           buildInputs = with pkgs; [
