@@ -19,3 +19,10 @@
 - Iced `0.14` does not appear to expose a general built-in virtual list widget for ordinary app code. The useful built-ins here were `keyed_column` for identity continuity and `lazy(...)` for rebuild avoidance, not true virtualization.
 - Converting the results view to `keyed_column + lazy` materially improved responsiveness for this app. That is an important practical middle step before attempting custom windowing or a bespoke widget.
 - The distinction matters: `lazy` reduces rebuilding, but it does not virtualize the list. If a picker still performs poorly after keyed/lazy rows, the next step is probably a manual visible-range implementation driven by `Scrollable::on_scroll`, not more generic “reactive” cleanup.
+
+## Correction After WGPU Was Working
+
+- Earlier investigation concluded that adding inner padding around the `scrollable` results list was the practical fix for a left-edge flicker artifact. That conclusion turned out to be incomplete because the app was still effectively being evaluated on the fallback/software path during much of that investigation.
+- After the Nix/runtime work made it possible to run the app successfully with `WGPU_BACKEND=gl ICED_BACKEND=wgpu cargo run`, the same artifact no longer reproduced with the padding removed.
+- The corrected lesson is that the flicker was not a toolkit-agnostic `scrollable` issue in all render paths. It was at least strongly dependent on the active renderer/backend path, and the padding workaround was not necessary once the app was running on the working `wgpu` GL path.
+- The debugging lesson is important: do not finalize renderer-sensitive UI conclusions until the app is confirmed to be running on the renderer/backend you actually intend to ship. A workaround discovered under fallback rendering may be unnecessary or misleading under `wgpu`.
