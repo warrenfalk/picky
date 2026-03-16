@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use iced::event;
 use iced::keyboard::{self, Key, key::Named};
+use iced::system;
 use iced::widget::{
     scrollable, Id, button, column, container, image, keyed_column, lazy, mouse_area, row, text,
     text_input,
@@ -49,6 +50,7 @@ enum Message {
     ResultSelected(usize),
     ResultActivated(usize),
     KeyPressed(AppKey),
+    SystemInfoLoaded(system::Information),
     SearchFinished {
         request_id: u64,
         result: Result<Vec<SearchResult>, String>,
@@ -60,6 +62,7 @@ pub struct PickerApp {
     registry: Arc<Mutex<ModuleRegistry>>,
     query: String,
     error_message: String,
+    renderer_warning: String,
     results: Vec<SearchResult>,
     selected_index: Option<usize>,
     focus_target: FocusTarget,
@@ -109,6 +112,7 @@ fn initialize() -> (PickerApp, Task<Message>) {
         registry: Arc::new(Mutex::new(ModuleRegistry::new(modules::default_modules()))),
         query: String::new(),
         error_message: String::new(),
+        renderer_warning: String::new(),
         results: Vec::new(),
         selected_index: None,
         focus_target: FocusTarget::Search,
@@ -119,6 +123,7 @@ fn initialize() -> (PickerApp, Task<Message>) {
 
     let task = Task::batch([
         focus(app.search_input_id.clone()),
+        system::information().map(Message::SystemInfoLoaded),
         app.request_search(),
     ]);
 
@@ -196,6 +201,11 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
             app.selected_index = Some(index);
             app.focus_target = FocusTarget::Results;
             app.activate_selected(DEFAULT_ACTION_ID)
+        }
+        Message::SystemInfoLoaded(info) => {
+            app.renderer_warning =
+                tiny_skia_warning(&info).map_or_else(String::new, str::to_string);
+            Task::none()
         }
         Message::KeyPressed(key) => match app.focus_target {
             FocusTarget::Search => app.handle_search_key(key),
@@ -289,10 +299,17 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
         text(&app.error_message)
     };
 
+    let warning = if app.renderer_warning.is_empty() {
+        text("")
+    } else {
+        text(&app.renderer_warning)
+    };
+
     container(
         column![
             search,
             text(format!("{} results", app.results.len())).size(14),
+            warning.size(14),
             scrollable(results_list).height(Length::Fill),
             error.size(14),
         ]
@@ -399,6 +416,12 @@ fn result_row_button_style(
         border: border::rounded(10),
         ..button::Style::default()
     }
+}
+
+fn tiny_skia_warning(info: &system::Information) -> Option<&'static str> {
+    info.graphics_backend
+        .eq_ignore_ascii_case("tiny-skia")
+        .then_some("Using software renderer (tiny-skia); performance may be degraded.")
 }
 
 impl PickerApp {
@@ -653,6 +676,7 @@ mod tests {
             registry: Arc::new(Mutex::new(ModuleRegistry::new(Vec::new()))),
             query: String::new(),
             error_message: String::new(),
+            renderer_warning: String::new(),
             selected_index: (!results.is_empty()).then_some(0),
             results,
             focus_target: FocusTarget::Search,
@@ -804,6 +828,56 @@ mod tests {
 
         assert_eq!(app.search_request_id, 1);
         assert_eq!(app.active_search_request_id, 1);
+    }
+
+    #[test]
+    fn tiny_skia_backend_sets_warning() {
+        let mut app = app_with_results(Vec::new());
+
+        let _ = update(
+            &mut app,
+            Message::SystemInfoLoaded(system::Information {
+                system_name: None,
+                system_kernel: None,
+                system_version: None,
+                system_short_version: None,
+                cpu_brand: String::new(),
+                cpu_cores: None,
+                memory_total: 0,
+                memory_used: None,
+                graphics_backend: "tiny-skia".to_string(),
+                graphics_adapter: "software".to_string(),
+            }),
+        );
+
+        assert_eq!(
+            app.renderer_warning,
+            "Using software renderer (tiny-skia); performance may be degraded."
+        );
+    }
+
+    #[test]
+    fn non_tiny_skia_backend_clears_warning() {
+        let mut app = app_with_results(Vec::new());
+        app.renderer_warning = "old warning".to_string();
+
+        let _ = update(
+            &mut app,
+            Message::SystemInfoLoaded(system::Information {
+                system_name: None,
+                system_kernel: None,
+                system_version: None,
+                system_short_version: None,
+                cpu_brand: String::new(),
+                cpu_cores: None,
+                memory_total: 0,
+                memory_used: None,
+                graphics_backend: "wgpu".to_string(),
+                graphics_adapter: "gpu".to_string(),
+            }),
+        );
+
+        assert!(app.renderer_warning.is_empty());
     }
 
     #[test]
