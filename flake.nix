@@ -7,8 +7,15 @@
     rust-overlay.url = "github:oxalica/rust-overlay";
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      rust-overlay,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
@@ -46,7 +53,11 @@
           export LD_LIBRARY_PATH="${graphicsLoaderPath}''${wayland_dir:+:''${wayland_dir}}"
         '';
         rustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
-          extensions = [ "clippy" "rust-src" "rustfmt" ];
+          extensions = [
+            "clippy"
+            "rust-src"
+            "rustfmt"
+          ];
         };
         rustPlatform = pkgs.makeRustPlatform {
           cargo = rustToolchain;
@@ -62,13 +73,22 @@
             pkg-config
             wrapGAppsHook4
           ];
-          buildInputs = with pkgs; [
-            gtk4
-          ] ++ runtimeLibs;
+          buildInputs =
+            with pkgs;
+            [
+              gtk4
+            ]
+            ++ runtimeLibs;
           postFixup = ''
             wrapProgram "$out/bin/picky" \
               --run '${graphicsRuntimeHook}' \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.firefox pkgs.gtk3 pkgs.niri ]}
+              --prefix PATH : ${
+                pkgs.lib.makeBinPath [
+                  pkgs.firefox
+                  pkgs.gtk3
+                  pkgs.niri
+                ]
+              }
           '';
         };
       in
@@ -118,5 +138,6 @@
         };
 
         formatter = pkgs.nixpkgs-fmt;
-      });
+      }
+    );
 }
