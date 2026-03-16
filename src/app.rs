@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::hash::{Hash, Hasher};
 
 use iced::event;
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{
-    Id, button, column, container, image, keyed_column, lazy, mouse_area, row, scrollable, text,
+    scrollable, Id, button, column, container, image, keyed_column, lazy, mouse_area, row, text,
     text_input,
 };
 use iced::widget::operation::{focus, focus_next};
