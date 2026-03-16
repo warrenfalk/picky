@@ -109,6 +109,7 @@
             firefox
             grim
             mesa-demos
+            nixfmt-rfc-style
             rustToolchain
             rust-analyzer
             pkg-config
@@ -137,7 +138,7 @@
           '';
         };
 
-        formatter = pkgs.nixpkgs-fmt;
+        formatter = pkgs.nixfmt-rfc-style;
       }
     );
 }
