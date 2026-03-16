@@ -24,7 +24,27 @@
           libGL
           vulkan-loader
         ];
-        runtimeLibraryPath = pkgs.lib.makeLibraryPath runtimeLibs;
+        graphicsLoaderLibs = with pkgs; [
+          libxkbcommon
+          libglvnd
+          vulkan-loader
+        ];
+        graphicsLoaderPath = pkgs.lib.makeLibraryPath graphicsLoaderLibs;
+        graphicsRuntimeHook = ''
+          wayland_dir=""
+          for icd_json in /run/opengl-driver/share/vulkan/icd.d/*.json; do
+            [ -r "$icd_json" ] || continue
+            vulkan_icd=$(sed -n 's/.*"library_path": "\(.*\)".*/\1/p' "$icd_json")
+            [ -r "$vulkan_icd" ] || continue
+            wayland_lib=$(LD_LIBRARY_PATH= ldd "$vulkan_icd" 2>/dev/null | awk '/libwayland-client.so.0/ { print $3; exit }')
+            if [ -n "$wayland_lib" ]; then
+              wayland_dir=$(dirname "$wayland_lib")
+              break
+            fi
+          done
+
+          export LD_LIBRARY_PATH="${graphicsLoaderPath}''${wayland_dir:+:''${wayland_dir}}"
+        '';
         rustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
           extensions = [ "clippy" "rust-src" "rustfmt" ];
         };
@@ -47,7 +67,7 @@
           ] ++ runtimeLibs;
           postFixup = ''
             wrapProgram "$out/bin/picky" \
-              --prefix LD_LIBRARY_PATH : ${runtimeLibraryPath} \
+              --run '${graphicsRuntimeHook}' \
               --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.firefox pkgs.gtk3 pkgs.niri ]}
           '';
         };
@@ -65,27 +85,34 @@
           name = "picky";
 
           packages = with pkgs; [
+            cage
             firefox
             grim
+            mesa-demos
             rustToolchain
             rust-analyzer
             pkg-config
             gtk3
             gtk4
             niri
+            slurp
+            vulkan-tools
+            wayland-utils
+            weston
+            wl-clipboard
             wtype
             ydotool
-          ] ++ runtimeLibs;
+          ];
 
           buildInputs = with pkgs; [
             gtk4
-          ] ++ runtimeLibs;
+          ];
 
           NIX_SHELL_PRESERVE_PROMPT = "1";
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
 
           shellHook = ''
-            export LD_LIBRARY_PATH="${runtimeLibraryPath}:''${LD_LIBRARY_PATH:-}"
+            ${graphicsRuntimeHook}
             export PS1="(picky) ''${PS1:-\\u@\\h:\\w \\$ }"
           '';
         };
