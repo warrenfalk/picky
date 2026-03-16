@@ -12,6 +12,7 @@ use crate::module::{
 const MODULE_KEY: &str = "mako-notifications";
 const EMPTY_QUERY_BASE_SCORE: i64 = 10_000;
 const DISMISS_ACTION_ID: &str = "dismiss";
+const GO_TO_ACTION_ID: &str = "go-to";
 
 pub struct MakoNotificationsModule {
     client: Box<dyn MakoClient>,
@@ -115,11 +116,18 @@ impl Module for MakoNotificationsModule {
                     subtitle,
                     icon_name: None,
                     kind: MatchKind::Notification,
-                    actions: vec![ResultAction {
-                        id: DISMISS_ACTION_ID,
-                        label: "Dismiss",
-                        shortcut: 'd',
-                    }],
+                    actions: vec![
+                        ResultAction {
+                            id: GO_TO_ACTION_ID,
+                            label: "Go to",
+                            shortcut: 'g',
+                        },
+                        ResultAction {
+                            id: DISMISS_ACTION_ID,
+                            label: "Dismiss",
+                            shortcut: 'd',
+                        },
+                    ],
                     score,
                 })
             })
@@ -148,6 +156,13 @@ impl Module for MakoNotificationsModule {
                 })?;
 
                 Ok(ActivationOutcome::ClosePicker)
+            }
+            GO_TO_ACTION_ID => {
+                if self.client.invoke(item_id)? {
+                    Ok(ActivationOutcome::ClosePicker)
+                } else {
+                    bail!("mako refused to invoke notification {item_id}");
+                }
             }
             DISMISS_ACTION_ID => {
                 self.client.dismiss(item_id)?;
@@ -306,7 +321,8 @@ mod tests {
         let results = module.search("").unwrap();
 
         assert_eq!(results[0].title, "New");
-        assert_eq!(results[0].actions[0].id, DISMISS_ACTION_ID);
+        assert_eq!(results[0].actions[0].id, GO_TO_ACTION_ID);
+        assert_eq!(results[0].actions[1].id, DISMISS_ACTION_ID);
     }
 
     #[test]
@@ -341,6 +357,24 @@ mod tests {
 
         assert_eq!(outcome, ActivationOutcome::ClosePicker);
         assert_eq!(state.lock().unwrap().dismisses.as_slice(), ["42"]);
+    }
+
+    #[test]
+    fn go_to_action_invokes_without_dismissing() {
+        let state = Arc::new(Mutex::new(FakeState {
+            invoke_success: true,
+            ..FakeState::default()
+        }));
+        let mut module = MakoNotificationsModule::with_client(Box::new(FakeMakoClient {
+            state: Arc::clone(&state),
+        }));
+
+        let outcome = module.activate("42", GO_TO_ACTION_ID).unwrap();
+
+        assert_eq!(outcome, ActivationOutcome::ClosePicker);
+        let state = state.lock().unwrap();
+        assert_eq!(state.invokes.as_slice(), ["42"]);
+        assert!(state.dismisses.is_empty());
     }
 
     #[test]
