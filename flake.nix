@@ -55,6 +55,11 @@
         graphicsRuntimeScript = pkgs.writeShellScript "picky-graphics-runtime" ''
           ${graphicsRuntimeHook}
         '';
+        runtimeBinPath = pkgs.lib.makeBinPath [
+          pkgs.firefox
+          pkgs.gtk3
+          pkgs.niri
+        ];
         rustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
           extensions = [
             "clippy"
@@ -83,14 +88,6 @@
             ]
             ++ runtimeLibs;
           postFixup = ''
-            runtime_bin_path="${
-              pkgs.lib.makeBinPath [
-                pkgs.firefox
-                pkgs.gtk3
-                pkgs.niri
-              ]
-            }"
-
             for bin in picky wgpu_probe; do
               wrapped="$out/bin/.''${bin}-wrapped"
               [ -x "$wrapped" ] || continue
@@ -99,8 +96,8 @@
                 '#!${pkgs.runtimeShell}' \
                 'set -eu' \
                 '. ${graphicsRuntimeScript}' \
-                'export PATH="''${runtime_bin_path}:\$PATH"' \
-                'exec "$wrapped" "$@"' \
+                "export PATH=\"${runtimeBinPath}:\$PATH\"" \
+                "exec \"$wrapped\" \"\$@\"" \
                 > "$out/bin/''${bin}"
 
               chmod +x "$out/bin/''${bin}"
