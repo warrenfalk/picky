@@ -1,23 +1,27 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+use iced::advanced::widget::{Operation, operate, operation::Outcome};
 use iced::event;
 use iced::keyboard::{self, Key, key::Named};
 use iced::system;
+use iced::widget::operation::{AbsoluteOffset, focus, focus_next, scroll_to};
+use iced::widget::scrollable::Viewport;
 use iced::widget::{
-    scrollable, Id, button, column, container, image, keyed_column, lazy, mouse_area, row, text,
+    Id, button, column, container, image, keyed_column, lazy, mouse_area, row, scrollable, text,
     text_input,
 };
-use iced::widget::operation::{focus, focus_next};
-use iced::{Background, Element, Length, Size, Subscription, Task, Theme, border, window};
+use iced::{
+    Background, Element, Length, Rectangle, Size, Subscription, Task, Theme, Vector, border, window,
+};
 use serde::Deserialize;
 
 use crate::module::{
-    ActivationOutcome, MatchKind, ModuleRegistry, ResultAction, SearchResult, DEFAULT_ACTION_ID,
+    ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, ModuleRegistry, ResultAction, SearchResult,
 };
 use crate::modules;
 
@@ -26,6 +30,7 @@ const DEFAULT_WINDOW_HEIGHT: f32 = 680.0;
 const WINDOW_HEIGHT_FRACTION: f32 = 0.7;
 const RESULT_ICON_SIZE: f32 = 28.0;
 const SUBTITLE_ICON_SIZE: f32 = 20.0;
+const RESULTS_SCROLL_MARGIN: f32 = 8.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FocusTarget {
@@ -49,6 +54,12 @@ enum Message {
     ActivateSelectedAction(&'static str),
     ResultSelected(usize),
     ResultActivated(usize),
+    ResultsScrolled(Viewport),
+    EnsureSelectedResultVisible(u64),
+    SelectedResultVisibilityMeasured {
+        request_id: u64,
+        measured: MeasuredSelectedResultVisibility,
+    },
     KeyPressed(AppKey),
     SystemInfoLoaded(system::Information),
     SearchFinished {
@@ -69,6 +80,10 @@ pub struct PickerApp {
     search_request_id: u64,
     active_search_request_id: u64,
     search_input_id: Id,
+    results_scroll_id: Id,
+    results_viewport: Option<Viewport>,
+    results_row_bounds: HashMap<Id, CachedRowBounds>,
+    selected_result_visibility_request_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +123,7 @@ fn theme(_app: &PickerApp) -> Theme {
 
 fn initialize() -> (PickerApp, Task<Message>) {
     let search_input_id = Id::unique();
+    let results_scroll_id = Id::new("results-scroll");
     let mut app = PickerApp {
         registry: Arc::new(Mutex::new(ModuleRegistry::new(modules::default_modules()))),
         query: String::new(),
@@ -119,6 +135,10 @@ fn initialize() -> (PickerApp, Task<Message>) {
         search_request_id: 0,
         active_search_request_id: 0,
         search_input_id,
+        results_scroll_id,
+        results_viewport: None,
+        results_row_bounds: HashMap::new(),
+        selected_result_visibility_request_id: 0,
     };
 
     let task = Task::batch([
@@ -188,6 +208,7 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
         Message::QueryChanged(query) => {
             app.query = query;
             app.focus_target = FocusTarget::Search;
+            app.invalidate_selected_result_scroll();
             app.request_search()
         }
         Message::ActivateSelected => app.activate_selected(DEFAULT_ACTION_ID),
@@ -195,12 +216,39 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
         Message::ResultSelected(index) => {
             app.selected_index = Some(index);
             app.focus_target = FocusTarget::Results;
-            Task::none()
+            app.schedule_selected_result_scroll()
         }
         Message::ResultActivated(index) => {
             app.selected_index = Some(index);
             app.focus_target = FocusTarget::Results;
             app.activate_selected(DEFAULT_ACTION_ID)
+        }
+        Message::ResultsScrolled(viewport) => {
+            app.results_viewport = Some(viewport);
+            Task::none()
+        }
+        Message::EnsureSelectedResultVisible(request_id) => {
+            app.measure_selected_result_visibility(request_id)
+        }
+        Message::SelectedResultVisibilityMeasured {
+            request_id,
+            measured,
+        } => {
+            if request_id != app.selected_result_visibility_request_id {
+                return Task::none();
+            }
+
+            app.results_row_bounds = measured.row_bounds;
+
+            measured.target_offset_y.map_or_else(Task::none, |offset_y| {
+                scroll_to(
+                    app.results_scroll_id.clone(),
+                    AbsoluteOffset {
+                        x: 0.0,
+                        y: offset_y,
+                    },
+                )
+            })
         }
         Message::SystemInfoLoaded(info) => {
             app.renderer_warning =
@@ -223,11 +271,18 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
                     app.selected_index = (!app.results.is_empty()).then_some(0);
 
                     if app.focus_target == FocusTarget::Results && !app.results.is_empty() {
-                        focus_first_result(&app.search_input_id)
+                        Task::batch([
+                            focus_first_result(&app.search_input_id),
+                            app.schedule_selected_result_scroll(),
+                        ])
+                    } else if !app.results.is_empty() {
+                        app.schedule_selected_result_scroll()
                     } else if app.results.is_empty() && app.focus_target == FocusTarget::Results {
                         app.focus_target = FocusTarget::Search;
+                        app.invalidate_selected_result_scroll();
                         focus(app.search_input_id.clone())
                     } else {
+                        app.invalidate_selected_result_scroll();
                         Task::none()
                     }
                 }
@@ -235,6 +290,7 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
                     app.error_message = error_message;
                     app.results.clear();
                     app.selected_index = None;
+                    app.invalidate_selected_result_scroll();
 
                     if app.focus_target == FocusTarget::Results {
                         app.focus_target = FocusTarget::Search;
@@ -283,10 +339,7 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
                         && app.focus_target == FocusTarget::Results,
                 };
 
-                (
-                    row_key(&row.result),
-                    lazy(row, view_result_row).into(),
-                )
+                (row_key(&row.result), lazy(row, view_result_row).into())
             })
             .collect::<Vec<_>>();
 
@@ -310,7 +363,10 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
             search,
             text(format!("{} results", app.results.len())).size(14),
             warning.size(14),
-            scrollable(results_list).height(Length::Fill),
+            scrollable(results_list)
+                .id(app.results_scroll_id.clone())
+                .on_scroll(Message::ResultsScrolled)
+                .height(Length::Fill),
             error.size(14),
         ]
         .spacing(10)
@@ -336,6 +392,7 @@ fn view_result_row(row_state: &ResultRowView) -> Element<'static, Message> {
     let is_selected = row_state.is_selected;
     let show_action_hints = row_state.show_action_hints;
     let result = &row_state.result;
+    let row_id = row_widget_id(result);
 
     let mut text_column = column![text(result.title.clone()).size(18)].spacing(4);
 
@@ -364,11 +421,15 @@ fn view_result_row(row_state: &ResultRowView) -> Element<'static, Message> {
         .width(Length::Fill);
 
     mouse_area(
-        button(container(row_content).width(Length::Fill))
-            .width(Length::Fill)
-            .padding(10)
-            .style(move |theme, status| result_row_button_style(theme, status, is_selected))
-            .on_press(Message::ResultSelected(index)),
+        container(
+            button(container(row_content).width(Length::Fill))
+                .width(Length::Fill)
+                .padding(10)
+                .style(move |theme, status| result_row_button_style(theme, status, is_selected))
+                .on_press(Message::ResultSelected(index)),
+        )
+        .id(row_id)
+        .width(Length::Fill),
     )
     .on_double_click(Message::ResultActivated(index))
     .into()
@@ -379,6 +440,13 @@ fn row_key(result: &SearchResult) -> u64 {
     result.module_key.hash(&mut hasher);
     result.item_id.hash(&mut hasher);
     hasher.finish()
+}
+
+fn row_widget_id(result: &SearchResult) -> Id {
+    Id::from(format!(
+        "result-row:{}:{}",
+        result.module_key, result.item_id
+    ))
 }
 
 fn result_row_button_style(
@@ -424,6 +492,164 @@ fn tiny_skia_warning(info: &system::Information) -> Option<&'static str> {
         .then_some("Using software renderer (tiny-skia); performance may be degraded.")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScrollableSnapshot {
+    bounds: Rectangle,
+    content_bounds: Rectangle,
+    offset: Vector,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CachedRowBounds {
+    top: f32,
+    height: f32,
+}
+
+#[derive(Clone, Debug)]
+struct MeasuredSelectedResultVisibility {
+    row_bounds: HashMap<Id, CachedRowBounds>,
+    target_offset_y: Option<f32>,
+}
+
+#[derive(Debug)]
+struct MeasureSelectedResultVisibilityOperation {
+    scrollable_id: Id,
+    tracked_row_ids: HashSet<Id>,
+    row_id: Id,
+    scrollable: Option<ScrollableSnapshot>,
+    row_bounds: HashMap<Id, Rectangle>,
+}
+
+impl MeasureSelectedResultVisibilityOperation {
+    fn new(scrollable_id: Id, tracked_row_ids: HashSet<Id>, row_id: Id) -> Self {
+        Self {
+            scrollable_id,
+            tracked_row_ids,
+            row_id,
+            scrollable: None,
+            row_bounds: HashMap::new(),
+        }
+    }
+}
+
+impl Operation<MeasuredSelectedResultVisibility> for MeasureSelectedResultVisibilityOperation {
+    fn traverse(
+        &mut self,
+        operate_on_children: &mut dyn FnMut(&mut dyn Operation<MeasuredSelectedResultVisibility>),
+    ) {
+        operate_on_children(self);
+    }
+
+    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+        let Some(id) = id.cloned() else {
+            return;
+        };
+
+        if self.tracked_row_ids.contains(&id) {
+            self.row_bounds.insert(id, bounds);
+        }
+    }
+
+    fn scrollable(
+        &mut self,
+        id: Option<&Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        translation: Vector,
+        _state: &mut dyn iced::advanced::widget::operation::Scrollable,
+    ) {
+        if id == Some(&self.scrollable_id) {
+            self.scrollable = Some(ScrollableSnapshot {
+                bounds,
+                content_bounds,
+                offset: translation,
+            });
+        }
+    }
+
+    fn finish(&self) -> Outcome<MeasuredSelectedResultVisibility> {
+        let Some(scrollable) = self.scrollable else {
+            return Outcome::Some(MeasuredSelectedResultVisibility {
+                row_bounds: HashMap::new(),
+                target_offset_y: None,
+            });
+        };
+
+        let row_bounds = self
+            .row_bounds
+            .iter()
+            .map(|(id, bounds)| {
+                (
+                    id.clone(),
+                    CachedRowBounds {
+                        top: bounds.y - scrollable.content_bounds.y,
+                        height: bounds.height,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let target_offset_y = row_bounds.get(&self.row_id).and_then(|row_bounds| {
+            scroll_offset_to_reveal_row(
+                scrollable.bounds.height,
+                scrollable.content_bounds.height,
+                scrollable.offset.y,
+                row_bounds.top,
+                row_bounds.height,
+            )
+        });
+
+        Outcome::Some(MeasuredSelectedResultVisibility {
+            row_bounds,
+            target_offset_y,
+        })
+    }
+}
+
+fn scroll_offset_to_reveal_row(
+    viewport_height: f32,
+    content_height: f32,
+    current_offset: f32,
+    row_top: f32,
+    row_height: f32,
+) -> Option<f32> {
+    let max_offset = (content_height - viewport_height).max(0.0);
+    let visible_top = current_offset;
+    let visible_bottom = current_offset + viewport_height;
+    let row_bottom = row_top + row_height;
+
+    if row_top < visible_top + RESULTS_SCROLL_MARGIN {
+        Some((row_top - RESULTS_SCROLL_MARGIN).max(0.0))
+    } else if row_bottom > visible_bottom - RESULTS_SCROLL_MARGIN {
+        Some((row_bottom - viewport_height + RESULTS_SCROLL_MARGIN).min(max_offset))
+    } else {
+        None
+    }
+}
+
+fn cached_scroll_offset_for_row(
+    viewport: Viewport,
+    row_bounds: CachedRowBounds,
+) -> Option<f32> {
+    let viewport_height = viewport.bounds().height;
+    let content_height = viewport.content_bounds().height;
+
+    if viewport_height <= 0.0 || content_height <= 0.0 {
+        return None;
+    }
+
+    // The measured pass is still the source of truth. This uses cached row
+    // bounds from the previous layout so the first scroll can move immediately
+    // without inventing new geometry.
+    scroll_offset_to_reveal_row(
+        viewport_height,
+        content_height,
+        viewport.absolute_offset().y,
+        row_bounds.top,
+        row_bounds.height,
+    )
+}
+
 impl PickerApp {
     fn request_search(&mut self) -> Task<Message> {
         self.search_request_id += 1;
@@ -452,7 +678,8 @@ impl PickerApp {
     }
 
     fn selected_result(&self) -> Option<&SearchResult> {
-        self.selected_index.and_then(|index| self.results.get(index))
+        self.selected_index
+            .and_then(|index| self.results.get(index))
     }
 
     fn handle_search_key(&mut self, key: AppKey) -> Task<Message> {
@@ -460,7 +687,10 @@ impl PickerApp {
             AppKey::Down if !self.results.is_empty() => {
                 self.focus_target = FocusTarget::Results;
                 self.selected_index = Some(0);
-                focus_first_result(&self.search_input_id)
+                Task::batch([
+                    focus_first_result(&self.search_input_id),
+                    self.schedule_selected_result_scroll(),
+                ])
             }
             AppKey::Escape => iced::exit(),
             _ => Task::none(),
@@ -475,13 +705,16 @@ impl PickerApp {
                     return if self.results.is_empty() {
                         Task::none()
                     } else {
-                        focus_first_result(&self.search_input_id)
+                        Task::batch([
+                            focus_first_result(&self.search_input_id),
+                            self.schedule_selected_result_scroll(),
+                        ])
                     };
                 };
 
                 if index + 1 < self.results.len() {
                     self.selected_index = Some(index + 1);
-                    Task::none()
+                    self.schedule_selected_result_scroll()
                 } else {
                     Task::none()
                 }
@@ -493,7 +726,7 @@ impl PickerApp {
                 }
                 Some(index) => {
                     self.selected_index = Some(index - 1);
-                    Task::none()
+                    self.schedule_selected_result_scroll()
                 }
             },
             AppKey::Enter => self.activate_selected(DEFAULT_ACTION_ID),
@@ -515,13 +748,75 @@ impl PickerApp {
             .find(|action| action.shortcut.to_ascii_lowercase() == shortcut)
             .map(|action| action.id)
     }
+
+    fn invalidate_selected_result_scroll(&mut self) {
+        self.selected_result_visibility_request_id += 1;
+    }
+
+    fn schedule_selected_result_scroll(&mut self) -> Task<Message> {
+        self.selected_result_visibility_request_id += 1;
+        let request_id = self.selected_result_visibility_request_id;
+
+        // We first scroll from cached row geometry right away so the new
+        // selection does not disappear for a frame. We still queue a measured
+        // follow-up pass because the current selection change may alter row
+        // heights, making the cached geometry stale.
+        //
+        // This needs to be sequential, not batched. If both tasks run in
+        // parallel, the corrective measurement can happen before the optimistic
+        // scroll has been applied, and the later optimistic scroll can leave
+        // the selected row only partially visible.
+        self.scroll_selected_result_into_view_from_cache()
+            .chain(Task::done(Message::EnsureSelectedResultVisible(request_id)))
+    }
+
+    fn scroll_selected_result_into_view_from_cache(&self) -> Task<Message> {
+        let Some(result) = self.selected_result() else {
+            return Task::none();
+        };
+        let Some(viewport) = self.results_viewport else {
+            return Task::none();
+        };
+        let row_id = row_widget_id(result);
+        let Some(row_bounds) = self.results_row_bounds.get(&row_id).copied() else {
+            return Task::none();
+        };
+        let Some(target_offset) = cached_scroll_offset_for_row(viewport, row_bounds) else {
+            return Task::none();
+        };
+
+        scroll_to(
+            self.results_scroll_id.clone(),
+            AbsoluteOffset {
+                x: 0.0,
+                y: target_offset,
+            },
+        )
+    }
+
+    fn measure_selected_result_visibility(&self, request_id: u64) -> Task<Message> {
+        let Some(result) = self.selected_result() else {
+            return Task::none();
+        };
+
+        let scrollable_id = self.results_scroll_id.clone();
+        let row_id = row_widget_id(result);
+        let tracked_row_ids = self.results.iter().map(row_widget_id).collect();
+
+        operate(MeasureSelectedResultVisibilityOperation::new(
+            scrollable_id.clone(),
+            tracked_row_ids,
+            row_id,
+        ))
+        .map(move |measured| Message::SelectedResultVisibilityMeasured {
+            request_id,
+            measured,
+        })
+    }
 }
 
 fn focus_first_result(search_input_id: &Id) -> Task<Message> {
-    Task::batch([
-        focus(search_input_id.clone()),
-        focus_next(),
-    ])
+    Task::batch([focus(search_input_id.clone()), focus_next()])
 }
 
 fn search_registry(
@@ -633,7 +928,11 @@ fn focused_output_height_for(
 
 fn window_height_for_output_height(output_height: Option<i32>) -> f32 {
     output_height
-        .map(|height| ((height as f32) * WINDOW_HEIGHT_FRACTION).round().max(360.0))
+        .map(|height| {
+            ((height as f32) * WINDOW_HEIGHT_FRACTION)
+                .round()
+                .max(360.0)
+        })
         .unwrap_or(DEFAULT_WINDOW_HEIGHT)
 }
 
@@ -683,6 +982,10 @@ mod tests {
             search_request_id: 0,
             active_search_request_id: 0,
             search_input_id: Id::unique(),
+            results_scroll_id: Id::new("results-scroll"),
+            results_viewport: None,
+            results_row_bounds: HashMap::new(),
+            selected_result_visibility_request_id: 0,
         }
     }
 
@@ -780,6 +1083,27 @@ mod tests {
     }
 
     #[test]
+    fn scroll_offset_moves_up_when_row_is_above_viewport() {
+        let offset = scroll_offset_to_reveal_row(100.0, 300.0, 80.0, 40.0, 20.0);
+
+        assert_eq!(offset, Some(32.0));
+    }
+
+    #[test]
+    fn scroll_offset_moves_down_when_row_is_below_viewport() {
+        let offset = scroll_offset_to_reveal_row(100.0, 300.0, 20.0, 110.0, 20.0);
+
+        assert_eq!(offset, Some(38.0));
+    }
+
+    #[test]
+    fn scroll_offset_stays_put_when_row_is_visible() {
+        let offset = scroll_offset_to_reveal_row(100.0, 300.0, 20.0, 40.0, 20.0);
+
+        assert_eq!(offset, None);
+    }
+
+    #[test]
     fn search_results_replace_state_and_select_first() {
         let mut app = app_with_results(Vec::new());
         app.active_search_request_id = 1;
@@ -788,7 +1112,10 @@ mod tests {
             &mut app,
             Message::SearchFinished {
                 request_id: 1,
-                result: Ok(vec![result("Firefox", Vec::new()), result("Calc", Vec::new())]),
+                result: Ok(vec![
+                    result("Firefox", Vec::new()),
+                    result("Calc", Vec::new()),
+                ]),
             },
         );
 
