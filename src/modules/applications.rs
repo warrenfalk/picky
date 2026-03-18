@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 
 use crate::fuzzy;
-use crate::module::{ActivationOutcome, MatchKind, Module, SearchResult, DEFAULT_ACTION_ID};
+use crate::module::{ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, SearchResult};
 
 const MODULE_KEY: &str = "applications";
 
@@ -223,7 +223,11 @@ fn collect_desktop_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
 fn parse_entry(applications_dir: &Path, desktop_file: &Path) -> Result<Option<ApplicationEntry>> {
     let contents = fs::read_to_string(desktop_file)
         .with_context(|| format!("failed to read {}", desktop_file.display()))?;
-    Ok(parse_entry_contents(&contents, applications_dir, desktop_file))
+    Ok(parse_entry_contents(
+        &contents,
+        applications_dir,
+        desktop_file,
+    ))
 }
 
 fn parse_entry_contents(
@@ -394,7 +398,12 @@ mod tests {
         let mut module = ApplicationsModule::with_launcher(
             vec![
                 entry("org.gnome.Calculator.desktop", "Calculator", "", "math"),
-                entry("org.mozilla.Firefox.desktop", "Firefox", "Web Browser", "browser web"),
+                entry(
+                    "org.mozilla.Firefox.desktop",
+                    "Firefox",
+                    "Web Browser",
+                    "browser web",
+                ),
             ],
             Box::new(ProcessApplicationLauncher),
         );

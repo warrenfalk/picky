@@ -1,10 +1,10 @@
 use std::process::{Command, Stdio};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::fuzzy;
-use crate::module::{ActivationOutcome, MatchKind, Module, SearchResult, DEFAULT_ACTION_ID};
+use crate::module::{ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, SearchResult};
 
 const MODULE_KEY: &str = "niri-workspaces";
 
@@ -252,9 +252,8 @@ mod tests {
             ],
             ..FakeState::default()
         }));
-        let mut module = NiriWorkspacesModule::with_backend(Box::new(FakeWorkspaceBackend {
-            state,
-        }));
+        let mut module =
+            NiriWorkspacesModule::with_backend(Box::new(FakeWorkspaceBackend { state }));
 
         let results = module.search("").unwrap();
 

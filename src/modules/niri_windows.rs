@@ -3,12 +3,12 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::fuzzy;
 use crate::module::{
-    ActivationOutcome, MatchKind, Module, ResultAction, SearchResult, DEFAULT_ACTION_ID,
+    ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, ResultAction, SearchResult,
 };
 
 const MODULE_KEY: &str = "niri-windows";
@@ -91,14 +91,14 @@ impl NiriWindowsModule {
             HashMap::new()
         });
 
-        Self::with_backend(
-            icon_index,
-            Box::new(ProcessWindowsBackend),
-        )
+        Self::with_backend(icon_index, Box::new(ProcessWindowsBackend))
     }
 
     fn with_backend(icon_index: HashMap<String, String>, backend: Box<dyn WindowsBackend>) -> Self {
-        Self { icon_index, backend }
+        Self {
+            icon_index,
+            backend,
+        }
     }
 }
 
@@ -409,12 +409,20 @@ mod tests {
         }
 
         fn focus_window(&self, window_id: &str) -> Result<()> {
-            self.state.lock().unwrap().focused.push(window_id.to_string());
+            self.state
+                .lock()
+                .unwrap()
+                .focused
+                .push(window_id.to_string());
             Ok(())
         }
 
         fn close_window(&self, window_id: &str) -> Result<()> {
-            self.state.lock().unwrap().closed.push(window_id.to_string());
+            self.state
+                .lock()
+                .unwrap()
+                .closed
+                .push(window_id.to_string());
             Ok(())
         }
 
@@ -437,7 +445,13 @@ mod tests {
         }
     }
 
-    fn window(id: u64, title: &str, app_id: &str, pid: Option<u32>, workspace_id: u64) -> NiriWindow {
+    fn window(
+        id: u64,
+        title: &str,
+        app_id: &str,
+        pid: Option<u32>,
+        workspace_id: u64,
+    ) -> NiriWindow {
         NiriWindow {
             id,
             title: title.to_string(),
@@ -463,10 +477,8 @@ mod tests {
             workspaces: vec![workspace(10, 2, Some("code"), "DP-1")],
             ..FakeState::default()
         }));
-        let mut module = NiriWindowsModule::with_backend(
-            HashMap::new(),
-            Box::new(FakeWindowsBackend { state }),
-        );
+        let mut module =
+            NiriWindowsModule::with_backend(HashMap::new(), Box::new(FakeWindowsBackend { state }));
 
         let results = module.search("fire").unwrap();
 

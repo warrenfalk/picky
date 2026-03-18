@@ -1,12 +1,12 @@
 use std::process::{Command, Stdio};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::fuzzy;
 use crate::module::{
-    ActivationOutcome, MatchKind, Module, ResultAction, SearchResult, DEFAULT_ACTION_ID,
+    ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, ResultAction, SearchResult,
 };
 
 const MODULE_KEY: &str = "mako-notifications";
@@ -290,12 +290,22 @@ mod tests {
         }
 
         fn dismiss(&self, item_id: &str) -> Result<()> {
-            self.state.lock().unwrap().dismisses.push(item_id.to_string());
+            self.state
+                .lock()
+                .unwrap()
+                .dismisses
+                .push(item_id.to_string());
             Ok(())
         }
     }
 
-    fn notification(id: u64, app_name: &str, summary: &str, body: &str, urgency: u8) -> Notification {
+    fn notification(
+        id: u64,
+        app_name: &str,
+        summary: &str,
+        body: &str,
+        urgency: u8,
+    ) -> Notification {
         Notification {
             id,
             app_name: app_name.to_string(),
@@ -314,9 +324,7 @@ mod tests {
             ],
             ..FakeState::default()
         }));
-        let mut module = MakoNotificationsModule::with_client(Box::new(FakeMakoClient {
-            state,
-        }));
+        let mut module = MakoNotificationsModule::with_client(Box::new(FakeMakoClient { state }));
 
         let results = module.search("").unwrap();
 

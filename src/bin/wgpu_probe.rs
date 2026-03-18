@@ -5,7 +5,10 @@ use std::pin::pin;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 fn main() {
-    println!("WAYLAND_DISPLAY={}", env::var("WAYLAND_DISPLAY").unwrap_or_default());
+    println!(
+        "WAYLAND_DISPLAY={}",
+        env::var("WAYLAND_DISPLAY").unwrap_or_default()
+    );
     println!("DISPLAY={}", env::var("DISPLAY").unwrap_or_default());
     println!(
         "ICED_BACKEND={}",
