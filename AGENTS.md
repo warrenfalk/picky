@@ -2,7 +2,7 @@
 
 ## Important
 
-Read `iced-best-practices.md` and follow the guidelines therein.
+Read `iced-best-practices/iced-best-practices.md` and follow the guidelines therein.
 
 ## Project Structure & Module Organization
 
