@@ -109,6 +109,7 @@ struct NiriWorkspaceInfo {
 
 pub fn run() -> iced::Result {
     iced::application(initialize, update, view)
+        .title("Picky")
         .subscription(subscription)
         .theme(theme)
         .window(window::Settings {
@@ -116,6 +117,10 @@ pub fn run() -> iced::Result {
             position: window::Position::Centered,
             decorations: false,
             resizable: false,
+            platform_specific: window::settings::PlatformSpecific {
+                application_id: "picky".to_string(),
+                ..window::settings::PlatformSpecific::default()
+            },
             ..window::Settings::default()
         })
         .run()
