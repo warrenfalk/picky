@@ -938,28 +938,16 @@ fn activate_result(
     .map_err(|error| error.to_string())
 }
 
-fn leading_visual(result: &SearchResult, is_selected: bool) -> Element<'static, Message> {
+fn leading_visual(result: &SearchResult, _is_selected: bool) -> Element<'static, Message> {
     if let Some(icon_path) = leading_icon_path(result) {
-        container(
-            image(image::Handle::from_path(icon_path))
-                .width(RESULT_ICON_SIZE)
-                .height(RESULT_ICON_SIZE),
-        )
-        .padding(10)
-        .style(move |_| icon_frame_style(is_selected))
-        .into()
+        image(image::Handle::from_path(icon_path))
+            .width(RESULT_ICON_SIZE)
+            .height(RESULT_ICON_SIZE)
+            .into()
     } else {
-        let (background, border_color, text_color) = kind_badge_colors(result.kind, is_selected);
-
-        container(text(kind_label(result.kind)).size(12).color(text_color))
-            .padding([8, 10])
-            .width(Length::Fixed(58.0))
-            .center_x(Length::Shrink)
-            .style(move |_| {
-                container::Style::default()
-                    .background(background)
-                    .border(border::rounded(12).width(1).color(border_color))
-            })
+        text(kind_symbol(result))
+            .size(24)
+            .width(Length::Fixed(RESULT_ICON_SIZE))
             .into()
     }
 }
@@ -992,12 +980,12 @@ fn icon_file_path(icon_name: Option<&str>) -> Option<PathBuf> {
     }
 }
 
-fn kind_label(kind: MatchKind) -> &'static str {
-    match kind {
-        MatchKind::Application => "APP",
-        MatchKind::Notification => "NOTE",
-        MatchKind::Window => "WIN",
-        MatchKind::Workspace => "SPACE",
+fn kind_symbol(result: &SearchResult) -> &'static str {
+    match result.kind {
+        MatchKind::Application => "📦",
+        MatchKind::Notification => "🔔",
+        MatchKind::Window => "🗖",
+        MatchKind::Workspace => "🖥",
     }
 }
 
@@ -1121,24 +1109,6 @@ fn results_surface_style(_theme: &Theme) -> container::Style {
         .color(theme_text())
 }
 
-fn icon_frame_style(is_selected: bool) -> container::Style {
-    let background = if is_selected {
-        color_from_rgba_hex(0xFFFFFF, 0.16)
-    } else {
-        color_from_hex(0x202742)
-    };
-
-    let border_color = if is_selected {
-        color_from_rgba_hex(0xFFFFFF, 0.20)
-    } else {
-        theme_border()
-    };
-
-    container::Style::default()
-        .background(background)
-        .border(border::rounded(12).width(1).color(border_color))
-}
-
 fn search_input_style(
     _theme: &Theme,
     status: iced::widget::text_input::Status,
@@ -1213,71 +1183,6 @@ fn results_scrollable_style(
     }
 }
 
-fn kind_badge_colors(kind: MatchKind, is_selected: bool) -> (Color, Color, Color) {
-    match kind {
-        MatchKind::Application => {
-            if is_selected {
-                (
-                    color_from_rgba_hex(0xFFFFFF, 0.16),
-                    color_from_rgba_hex(0xFFFFFF, 0.20),
-                    color_from_hex(0xF7FAFF),
-                )
-            } else {
-                (
-                    color_from_rgba_hex(0x86A8FF, 0.14),
-                    color_from_rgba_hex(0x86A8FF, 0.26),
-                    theme_blue(),
-                )
-            }
-        }
-        MatchKind::Notification => {
-            if is_selected {
-                (
-                    color_from_rgba_hex(0xFFFFFF, 0.16),
-                    color_from_rgba_hex(0xFFFFFF, 0.20),
-                    color_from_hex(0xF7FAFF),
-                )
-            } else {
-                (
-                    color_from_rgba_hex(0xC3A2FF, 0.14),
-                    color_from_rgba_hex(0xC3A2FF, 0.26),
-                    theme_purple(),
-                )
-            }
-        }
-        MatchKind::Window => {
-            if is_selected {
-                (
-                    color_from_rgba_hex(0xFFFFFF, 0.16),
-                    color_from_rgba_hex(0xFFFFFF, 0.20),
-                    color_from_hex(0xF7FAFF),
-                )
-            } else {
-                (
-                    color_from_rgba_hex(0xA8D469, 0.14),
-                    color_from_rgba_hex(0xA8D469, 0.26),
-                    theme_lime(),
-                )
-            }
-        }
-        MatchKind::Workspace => {
-            if is_selected {
-                (
-                    color_from_rgba_hex(0xFFFFFF, 0.16),
-                    color_from_rgba_hex(0xFFFFFF, 0.20),
-                    color_from_hex(0xF7FAFF),
-                )
-            } else {
-                (
-                    color_from_rgba_hex(0xE18497, 0.14),
-                    color_from_rgba_hex(0xE18497, 0.26),
-                    theme_error(),
-                )
-            }
-        }
-    }
-}
-
 fn color_from_hex(hex: u32) -> Color {
     let red = ((hex >> 16) & 0xFF) as u8;
     let green = ((hex >> 8) & 0xFF) as u8;
@@ -1322,14 +1227,6 @@ fn theme_muted_text() -> Color {
 
 fn theme_blue() -> Color {
     color_from_hex(0x86A8FF)
-}
-
-fn theme_lime() -> Color {
-    color_from_hex(0xA8D469)
-}
-
-fn theme_purple() -> Color {
-    color_from_hex(0xC3A2FF)
 }
 
 fn theme_error() -> Color {
