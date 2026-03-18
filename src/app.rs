@@ -112,11 +112,13 @@ pub fn run() -> iced::Result {
         .title("Picky")
         .subscription(subscription)
         .theme(theme)
+        .style(application_style)
         .window(window::Settings {
             size: Size::new(WINDOW_WIDTH, initial_window_height()),
             position: window::Position::Centered,
             decorations: false,
             resizable: false,
+            transparent: true,
             platform_specific: window::settings::PlatformSpecific {
                 application_id: "picky".to_string(),
                 ..window::settings::PlatformSpecific::default()
@@ -138,6 +140,13 @@ fn theme(_app: &PickerApp) -> Theme {
             danger: color_from_hex(0xE18497),
         },
     )
+}
+
+fn application_style(_app: &PickerApp, _theme: &Theme) -> theme::Style {
+    theme::Style {
+        background_color: Color::TRANSPARENT,
+        text_color: theme_text(),
+    }
 }
 
 fn initialize() -> (PickerApp, Task<Message>) {
@@ -421,7 +430,7 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
             .height(Length::Fill)
             .style(shell_style),
     )
-    .padding(16)
+    .padding(20)
     .width(Length::Fill)
     .height(Length::Fill)
     .style(app_background_style)
@@ -1079,9 +1088,7 @@ fn view_status_banner(
 }
 
 fn app_background_style(_theme: &Theme) -> container::Style {
-    container::Style::default()
-        .background(theme_window_background())
-        .color(theme_text())
+    container::Style::default().color(theme_text())
 }
 
 fn shell_style(_theme: &Theme) -> container::Style {
@@ -1283,10 +1290,6 @@ fn color_from_rgba_hex(hex: u32, alpha: f32) -> Color {
     let green = ((hex >> 8) & 0xFF) as u8;
     let blue = (hex & 0xFF) as u8;
     Color::from_rgba8(red, green, blue, alpha)
-}
-
-fn theme_window_background() -> Color {
-    color_from_hex(0x151A2D)
 }
 
 fn theme_shell_surface() -> Color {
