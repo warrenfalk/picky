@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,7 +16,8 @@ use iced::widget::{
     text_input,
 };
 use iced::{
-    Background, Element, Length, Rectangle, Size, Subscription, Task, Theme, Vector, border, window,
+    Alignment, Background, Color, Element, Length, Rectangle, Shadow, Size, Subscription, Task,
+    Theme, Vector, border, theme, window,
 };
 use serde::Deserialize;
 
@@ -31,6 +32,9 @@ const WINDOW_HEIGHT_FRACTION: f32 = 0.7;
 const RESULT_ICON_SIZE: f32 = 28.0;
 const SUBTITLE_ICON_SIZE: f32 = 20.0;
 const RESULTS_SCROLL_MARGIN: f32 = 8.0;
+const SHELL_RADIUS: f32 = 28.0;
+const CARD_RADIUS: f32 = 16.0;
+const CHIP_RADIUS: f32 = 999.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FocusTarget {
@@ -118,7 +122,17 @@ pub fn run() -> iced::Result {
 }
 
 fn theme(_app: &PickerApp) -> Theme {
-    Theme::Dark
+    Theme::custom(
+        "Picky Control Center",
+        theme::Palette {
+            background: color_from_hex(0x151A2D),
+            text: color_from_hex(0xE5EAFE),
+            primary: color_from_hex(0x86A8FF),
+            success: color_from_hex(0xA8D469),
+            warning: color_from_hex(0xC3A2FF),
+            danger: color_from_hex(0xE18497),
+        },
+    )
 }
 
 fn initialize() -> (PickerApp, Task<Message>) {
@@ -240,15 +254,17 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
 
             app.results_row_bounds = measured.row_bounds;
 
-            measured.target_offset_y.map_or_else(Task::none, |offset_y| {
-                scroll_to(
-                    app.results_scroll_id.clone(),
-                    AbsoluteOffset {
-                        x: 0.0,
-                        y: offset_y,
-                    },
-                )
-            })
+            measured
+                .target_offset_y
+                .map_or_else(Task::none, |offset_y| {
+                    scroll_to(
+                        app.results_scroll_id.clone(),
+                        AbsoluteOffset {
+                            x: 0.0,
+                            y: offset_y,
+                        },
+                    )
+                })
         }
         Message::SystemInfoLoaded(info) => {
             app.renderer_warning =
@@ -317,14 +333,24 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
         .id(app.search_input_id.clone())
         .on_input(Message::QueryChanged)
         .on_submit(Message::ActivateSelected)
-        .padding(12)
-        .size(24);
+        .padding([14, 16])
+        .size(22)
+        .style(search_input_style);
 
     let results_list: Element<'_, Message> = if app.results.is_empty() {
-        column![text("No matches.")]
-            .spacing(8)
-            .width(Length::Fill)
-            .into()
+        container(
+            column![
+                text("No matches").size(22).color(theme_text()),
+                text("Refine the query or switch focus with the arrow keys.")
+                    .size(14)
+                    .color(theme_secondary_text()),
+            ]
+            .spacing(6),
+        )
+        .padding(20)
+        .style(panel_card_style)
+        .width(Length::Fill)
+        .into()
     } else {
         let rows = app
             .results
@@ -346,36 +372,54 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
         keyed_column(rows).spacing(6).width(Length::Fill).into()
     };
 
-    let error = if app.error_message.is_empty() {
-        text("")
-    } else {
-        text(&app.error_message)
-    };
+    let search_panel = container(search).padding(18).style(panel_card_style);
 
-    let warning = if app.renderer_warning.is_empty() {
-        text("")
-    } else {
-        text(&app.renderer_warning)
-    };
-
-    container(
-        column![
-            search,
-            text(format!("{} results", app.results.len())).size(14),
-            warning.size(14),
+    let mut content = column![
+        search_panel,
+        text(format!("{} results", app.results.len()))
+            .size(14)
+            .color(theme_secondary_text()),
+        container(
             scrollable(results_list)
                 .id(app.results_scroll_id.clone())
                 .on_scroll(Message::ResultsScrolled)
+                .style(results_scrollable_style)
                 .height(Length::Fill),
-            error.size(14),
-        ]
-        .spacing(10)
-        .padding(18)
-        .width(Length::Fill)
-        .height(Length::Fill),
+        )
+        .padding(10)
+        .height(Length::Fill)
+        .style(results_surface_style),
+    ]
+    .spacing(14)
+    .height(Length::Fill);
+
+    if !app.renderer_warning.is_empty() {
+        content = content.push(view_status_banner(
+            "Renderer",
+            app.renderer_warning.clone(),
+            BannerTone::Warning,
+        ));
+    }
+
+    if !app.error_message.is_empty() {
+        content = content.push(view_status_banner(
+            "Error",
+            app.error_message.clone(),
+            BannerTone::Danger,
+        ));
+    }
+
+    container(
+        container(content)
+            .padding(20)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(shell_style),
     )
+    .padding(16)
     .width(Length::Fill)
     .height(Length::Fill)
+    .style(app_background_style)
     .into()
 }
 
@@ -387,14 +431,31 @@ struct ResultRowView {
     show_action_hints: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BannerTone {
+    Warning,
+    Danger,
+}
+
 fn view_result_row(row_state: &ResultRowView) -> Element<'static, Message> {
     let index = row_state.index;
     let is_selected = row_state.is_selected;
     let show_action_hints = row_state.show_action_hints;
     let result = &row_state.result;
     let row_id = row_widget_id(result);
+    let title_color = if is_selected {
+        color_from_hex(0xF7FAFF)
+    } else {
+        theme_text()
+    };
+    let subtitle_color = if is_selected {
+        color_from_hex(0xD9E3FF)
+    } else {
+        theme_secondary_text()
+    };
 
-    let mut text_column = column![text(result.title.clone()).size(18)].spacing(4);
+    let mut text_column =
+        column![text(result.title.clone()).size(18).color(title_color)].spacing(6);
 
     if !result.subtitle.trim().is_empty() {
         let subtitle_line = if let Some(icon_path) = subtitle_icon_path(result) {
@@ -402,29 +463,41 @@ fn view_result_row(row_state: &ResultRowView) -> Element<'static, Message> {
                 image(image::Handle::from_path(icon_path))
                     .width(SUBTITLE_ICON_SIZE)
                     .height(SUBTITLE_ICON_SIZE),
-                text(result.subtitle.clone()).size(14)
+                text(result.subtitle.clone()).size(14).color(subtitle_color)
             ]
+            .align_y(Alignment::Center)
             .spacing(6)
         } else {
-            row![text(result.subtitle.clone()).size(14)]
+            row![text(result.subtitle.clone()).size(14).color(subtitle_color)]
         };
 
         text_column = text_column.push(subtitle_line);
     }
 
     if show_action_hints && !result.actions.is_empty() {
-        text_column = text_column.push(text(format_action_hints(&result.actions)).size(13));
+        let action_row = result
+            .actions
+            .iter()
+            .fold(row![].spacing(8), |row, action| {
+                row.push(view_action_chip(action, is_selected))
+            });
+
+        text_column = text_column.push(action_row);
     }
 
-    let row_content = row![leading_visual(result), text_column.width(Length::Fill)]
-        .spacing(10)
-        .width(Length::Fill);
+    let row_content = row![
+        leading_visual(result, is_selected),
+        text_column.width(Length::Fill)
+    ]
+    .align_y(Alignment::Center)
+    .spacing(12)
+    .width(Length::Fill);
 
     mouse_area(
         container(
             button(container(row_content).width(Length::Fill))
                 .width(Length::Fill)
-                .padding(10)
+                .padding(12)
                 .style(move |theme, status| result_row_button_style(theme, status, is_selected))
                 .on_press(Message::ResultSelected(index)),
         )
@@ -450,38 +523,46 @@ fn row_widget_id(result: &SearchResult) -> Id {
 }
 
 fn result_row_button_style(
-    theme: &Theme,
+    _theme: &Theme,
     status: button::Status,
     is_selected: bool,
 ) -> button::Style {
-    let palette = theme.extended_palette();
-
     if is_selected {
         let background = match status {
-            button::Status::Hovered | button::Status::Pressed => palette.primary.strong.color,
-            button::Status::Active | button::Status::Disabled => palette.primary.base.color,
+            button::Status::Hovered | button::Status::Pressed => color_from_hex(0x6D8FF5),
+            button::Status::Active | button::Status::Disabled => color_from_hex(0x5E79D8),
         };
 
         return button::Style {
             background: Some(Background::Color(background)),
-            text_color: palette.primary.base.text,
-            border: border::rounded(10)
+            text_color: color_from_hex(0xF7FAFF),
+            border: border::rounded(CARD_RADIUS)
                 .width(1)
-                .color(palette.primary.strong.color),
+                .color(color_from_hex(0x97B6FF)),
+            shadow: Shadow {
+                color: color_from_rgba_hex(0x080D16, 0.20),
+                offset: Vector::new(0.0, 8.0),
+                blur_radius: 18.0,
+            },
             ..button::Style::default()
         };
     }
 
     let background = match status {
-        button::Status::Hovered => Some(Background::Color(palette.background.weak.color)),
-        button::Status::Pressed => Some(Background::Color(palette.background.strong.color)),
-        button::Status::Active | button::Status::Disabled => None,
+        button::Status::Hovered => color_from_hex(0x2D3550),
+        button::Status::Pressed => color_from_hex(0x333D5B),
+        button::Status::Active | button::Status::Disabled => theme_card_surface(),
     };
 
     button::Style {
-        background,
-        text_color: palette.background.base.text,
-        border: border::rounded(10),
+        background: Some(Background::Color(background)),
+        text_color: theme_text(),
+        border: border::rounded(CARD_RADIUS).width(1).color(theme_border()),
+        shadow: Shadow {
+            color: color_from_rgba_hex(0x050913, 0.18),
+            offset: Vector::new(0.0, 4.0),
+            blur_radius: 12.0,
+        },
         ..button::Style::default()
     }
 }
@@ -627,10 +708,7 @@ fn scroll_offset_to_reveal_row(
     }
 }
 
-fn cached_scroll_offset_for_row(
-    viewport: Viewport,
-    row_bounds: CachedRowBounds,
-) -> Option<f32> {
+fn cached_scroll_offset_for_row(viewport: Viewport, row_bounds: CachedRowBounds) -> Option<f32> {
     let viewport_height = viewport.bounds().height;
     let content_height = viewport.content_bounds().height;
 
@@ -846,16 +924,28 @@ fn activate_result(
     .map_err(|error| error.to_string())
 }
 
-fn leading_visual(result: &SearchResult) -> Element<'static, Message> {
+fn leading_visual(result: &SearchResult, is_selected: bool) -> Element<'static, Message> {
     if let Some(icon_path) = leading_icon_path(result) {
-        image(image::Handle::from_path(icon_path))
-            .width(RESULT_ICON_SIZE)
-            .height(RESULT_ICON_SIZE)
-            .into()
+        container(
+            image(image::Handle::from_path(icon_path))
+                .width(RESULT_ICON_SIZE)
+                .height(RESULT_ICON_SIZE),
+        )
+        .padding(10)
+        .style(move |_| icon_frame_style(is_selected))
+        .into()
     } else {
-        text(kind_symbol(result))
-            .size(24)
-            .width(Length::Fixed(RESULT_ICON_SIZE))
+        let (background, border_color, text_color) = kind_badge_colors(result.kind, is_selected);
+
+        container(text(kind_label(result.kind)).size(12).color(text_color))
+            .padding([8, 10])
+            .width(Length::Fixed(58.0))
+            .center_x(Length::Shrink)
+            .style(move |_| {
+                container::Style::default()
+                    .background(background)
+                    .border(border::rounded(12).width(1).color(border_color))
+            })
             .into()
     }
 }
@@ -888,21 +978,354 @@ fn icon_file_path(icon_name: Option<&str>) -> Option<PathBuf> {
     }
 }
 
-fn kind_symbol(result: &SearchResult) -> &'static str {
-    match result.kind {
-        MatchKind::Application => "📦",
-        MatchKind::Notification => "🔔",
-        MatchKind::Window => "🗖",
-        MatchKind::Workspace => "🖥",
+fn kind_label(kind: MatchKind) -> &'static str {
+    match kind {
+        MatchKind::Application => "APP",
+        MatchKind::Notification => "NOTE",
+        MatchKind::Window => "WIN",
+        MatchKind::Workspace => "SPACE",
     }
 }
 
-fn format_action_hints(actions: &[ResultAction]) -> String {
-    actions
-        .iter()
-        .map(|action| format!("{} - {}", action.shortcut, action.label))
-        .collect::<Vec<_>>()
-        .join("   ")
+fn view_action_chip(action: &ResultAction, is_selected: bool) -> Element<'static, Message> {
+    let label_color = if is_selected {
+        color_from_hex(0xF7FAFF)
+    } else {
+        theme_text()
+    };
+
+    let shortcut_background = if is_selected {
+        color_from_rgba_hex(0xFFFFFF, 0.16)
+    } else {
+        color_from_rgba_hex(0x86A8FF, 0.12)
+    };
+
+    container(
+        row![
+            container(
+                text(action.shortcut.to_string())
+                    .size(12)
+                    .color(if is_selected {
+                        label_color
+                    } else {
+                        theme_blue()
+                    }),
+            )
+            .padding([4, 8])
+            .style(move |_| {
+                container::Style::default()
+                    .background(shortcut_background)
+                    .border(border::rounded(CHIP_RADIUS))
+            }),
+            text(action.label).size(13).color(label_color),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(8),
+    )
+    .padding([7, 10])
+    .style(move |_| {
+        container::Style::default()
+            .background(if is_selected {
+                color_from_rgba_hex(0xFFFFFF, 0.10)
+            } else {
+                color_from_hex(0x212842)
+            })
+            .border(border::rounded(CHIP_RADIUS).width(1).color(if is_selected {
+                color_from_rgba_hex(0xFFFFFF, 0.12)
+            } else {
+                theme_border()
+            }))
+    })
+    .into()
+}
+
+fn view_status_banner(
+    label: &'static str,
+    message: String,
+    tone: BannerTone,
+) -> Element<'static, Message> {
+    let (accent, background, border_color) = match tone {
+        BannerTone::Warning => (
+            color_from_hex(0xE7B779),
+            color_from_rgba_hex(0xE7B779, 0.10),
+            color_from_rgba_hex(0xE7B779, 0.30),
+        ),
+        BannerTone::Danger => (
+            theme_error(),
+            color_from_rgba_hex(0xE18497, 0.10),
+            color_from_rgba_hex(0xE18497, 0.30),
+        ),
+    };
+
+    container(
+        column![
+            text(label.to_uppercase()).size(11).color(accent),
+            text(message).size(14).color(theme_text()),
+        ]
+        .spacing(6),
+    )
+    .padding(14)
+    .style(move |_| {
+        container::Style::default()
+            .background(background)
+            .border(border::rounded(CARD_RADIUS).width(1).color(border_color))
+    })
+    .into()
+}
+
+fn app_background_style(_theme: &Theme) -> container::Style {
+    container::Style::default()
+        .background(theme_window_background())
+        .color(theme_text())
+}
+
+fn shell_style(_theme: &Theme) -> container::Style {
+    container::Style::default()
+        .background(theme_shell_surface())
+        .border(
+            border::rounded(SHELL_RADIUS)
+                .width(2)
+                .color(color_from_hex(0x3C4567)),
+        )
+        .shadow(Shadow {
+            color: color_from_rgba_hex(0x050913, 0.42),
+            offset: Vector::new(0.0, 14.0),
+            blur_radius: 36.0,
+        })
+        .color(theme_text())
+}
+
+fn panel_card_style(_theme: &Theme) -> container::Style {
+    container::Style::default()
+        .background(theme_panel_surface())
+        .border(border::rounded(CARD_RADIUS).width(1).color(theme_border()))
+        .color(theme_text())
+}
+
+fn results_surface_style(_theme: &Theme) -> container::Style {
+    container::Style::default()
+        .background(color_from_hex(0x1F2437))
+        .border(border::rounded(CARD_RADIUS).width(1).color(theme_border()))
+        .color(theme_text())
+}
+
+fn icon_frame_style(is_selected: bool) -> container::Style {
+    let background = if is_selected {
+        color_from_rgba_hex(0xFFFFFF, 0.16)
+    } else {
+        color_from_hex(0x202742)
+    };
+
+    let border_color = if is_selected {
+        color_from_rgba_hex(0xFFFFFF, 0.20)
+    } else {
+        theme_border()
+    };
+
+    container::Style::default()
+        .background(background)
+        .border(border::rounded(12).width(1).color(border_color))
+}
+
+fn search_input_style(
+    _theme: &Theme,
+    status: iced::widget::text_input::Status,
+) -> iced::widget::text_input::Style {
+    let border_color = match status {
+        iced::widget::text_input::Status::Active => theme_border(),
+        iced::widget::text_input::Status::Hovered => color_from_hex(0x4A567D),
+        iced::widget::text_input::Status::Focused { .. } => theme_blue(),
+        iced::widget::text_input::Status::Disabled => color_from_hex(0x303750),
+    };
+
+    let background = match status {
+        iced::widget::text_input::Status::Disabled => color_from_hex(0x20253A),
+        iced::widget::text_input::Status::Active
+        | iced::widget::text_input::Status::Hovered
+        | iced::widget::text_input::Status::Focused { .. } => color_from_hex(0x1A2033),
+    };
+
+    iced::widget::text_input::Style {
+        background: Background::Color(background),
+        border: border::rounded(CARD_RADIUS).width(1).color(border_color),
+        icon: theme_secondary_text(),
+        placeholder: theme_muted_text(),
+        value: theme_text(),
+        selection: color_from_rgba_hex(0x86A8FF, 0.28),
+    }
+}
+
+fn results_scrollable_style(
+    _theme: &Theme,
+    status: iced::widget::scrollable::Status,
+) -> iced::widget::scrollable::Style {
+    let is_active = matches!(
+        status,
+        iced::widget::scrollable::Status::Hovered {
+            is_vertical_scrollbar_hovered: true,
+            ..
+        } | iced::widget::scrollable::Status::Dragged {
+            is_vertical_scrollbar_dragged: true,
+            ..
+        }
+    );
+
+    let scroller_color = if is_active {
+        color_from_hex(0x6C8EF4)
+    } else {
+        color_from_hex(0x465176)
+    };
+
+    let rail = iced::widget::scrollable::Rail {
+        background: Some(Background::Color(color_from_rgba_hex(0x0C111C, 0.18))),
+        border: border::rounded(CHIP_RADIUS),
+        scroller: iced::widget::scrollable::Scroller {
+            background: Background::Color(scroller_color),
+            border: border::rounded(CHIP_RADIUS)
+                .width(1)
+                .color(color_from_rgba_hex(0xA5BEFF, 0.18)),
+        },
+    };
+
+    iced::widget::scrollable::Style {
+        container: container::Style::default(),
+        vertical_rail: rail,
+        horizontal_rail: rail,
+        gap: None,
+        auto_scroll: iced::widget::scrollable::AutoScroll {
+            background: Background::Color(color_from_rgba_hex(0x0C111C, 0.30)),
+            border: border::rounded(12),
+            shadow: Shadow::default(),
+            icon: theme_text(),
+        },
+    }
+}
+
+fn kind_badge_colors(kind: MatchKind, is_selected: bool) -> (Color, Color, Color) {
+    match kind {
+        MatchKind::Application => {
+            if is_selected {
+                (
+                    color_from_rgba_hex(0xFFFFFF, 0.16),
+                    color_from_rgba_hex(0xFFFFFF, 0.20),
+                    color_from_hex(0xF7FAFF),
+                )
+            } else {
+                (
+                    color_from_rgba_hex(0x86A8FF, 0.14),
+                    color_from_rgba_hex(0x86A8FF, 0.26),
+                    theme_blue(),
+                )
+            }
+        }
+        MatchKind::Notification => {
+            if is_selected {
+                (
+                    color_from_rgba_hex(0xFFFFFF, 0.16),
+                    color_from_rgba_hex(0xFFFFFF, 0.20),
+                    color_from_hex(0xF7FAFF),
+                )
+            } else {
+                (
+                    color_from_rgba_hex(0xC3A2FF, 0.14),
+                    color_from_rgba_hex(0xC3A2FF, 0.26),
+                    theme_purple(),
+                )
+            }
+        }
+        MatchKind::Window => {
+            if is_selected {
+                (
+                    color_from_rgba_hex(0xFFFFFF, 0.16),
+                    color_from_rgba_hex(0xFFFFFF, 0.20),
+                    color_from_hex(0xF7FAFF),
+                )
+            } else {
+                (
+                    color_from_rgba_hex(0xA8D469, 0.14),
+                    color_from_rgba_hex(0xA8D469, 0.26),
+                    theme_lime(),
+                )
+            }
+        }
+        MatchKind::Workspace => {
+            if is_selected {
+                (
+                    color_from_rgba_hex(0xFFFFFF, 0.16),
+                    color_from_rgba_hex(0xFFFFFF, 0.20),
+                    color_from_hex(0xF7FAFF),
+                )
+            } else {
+                (
+                    color_from_rgba_hex(0xE18497, 0.14),
+                    color_from_rgba_hex(0xE18497, 0.26),
+                    theme_error(),
+                )
+            }
+        }
+    }
+}
+
+fn color_from_hex(hex: u32) -> Color {
+    let red = ((hex >> 16) & 0xFF) as u8;
+    let green = ((hex >> 8) & 0xFF) as u8;
+    let blue = (hex & 0xFF) as u8;
+    Color::from_rgb8(red, green, blue)
+}
+
+fn color_from_rgba_hex(hex: u32, alpha: f32) -> Color {
+    let red = ((hex >> 16) & 0xFF) as u8;
+    let green = ((hex >> 8) & 0xFF) as u8;
+    let blue = (hex & 0xFF) as u8;
+    Color::from_rgba8(red, green, blue, alpha)
+}
+
+fn theme_window_background() -> Color {
+    color_from_hex(0x151A2D)
+}
+
+fn theme_shell_surface() -> Color {
+    color_from_hex(0x1B2135)
+}
+
+fn theme_panel_surface() -> Color {
+    color_from_hex(0x272E47)
+}
+
+fn theme_card_surface() -> Color {
+    color_from_hex(0x252C45)
+}
+
+fn theme_border() -> Color {
+    color_from_hex(0x3B4465)
+}
+
+fn theme_text() -> Color {
+    color_from_hex(0xE5EAFE)
+}
+
+fn theme_secondary_text() -> Color {
+    color_from_hex(0xA2ABC9)
+}
+
+fn theme_muted_text() -> Color {
+    color_from_hex(0x7B84A7)
+}
+
+fn theme_blue() -> Color {
+    color_from_hex(0x86A8FF)
+}
+
+fn theme_lime() -> Color {
+    color_from_hex(0xA8D469)
+}
+
+fn theme_purple() -> Color {
+    color_from_hex(0xC3A2FF)
+}
+
+fn theme_error() -> Color {
+    color_from_hex(0xE18497)
 }
 
 fn initial_window_height() -> f32 {
