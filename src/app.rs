@@ -944,6 +944,17 @@ fn leading_visual(result: &SearchResult, _is_selected: bool) -> Element<'static,
             .width(RESULT_ICON_SIZE)
             .height(RESULT_ICON_SIZE)
             .into()
+    } else if let Some(icon_path) = notification_icon_path(result) {
+        column![
+            text(kind_symbol(result)).size(20),
+            image(image::Handle::from_path(icon_path))
+                .width(SUBTITLE_ICON_SIZE)
+                .height(SUBTITLE_ICON_SIZE),
+        ]
+        .align_x(Alignment::Center)
+        .spacing(4)
+        .width(Length::Fixed(RESULT_ICON_SIZE + 8.0))
+        .into()
     } else {
         text(kind_symbol(result))
             .size(24)
@@ -961,6 +972,14 @@ fn leading_icon_path(result: &SearchResult) -> Option<PathBuf> {
 
 fn subtitle_icon_path(result: &SearchResult) -> Option<PathBuf> {
     if result.kind == MatchKind::Window {
+        icon_file_path(result.icon_name.as_deref())
+    } else {
+        None
+    }
+}
+
+fn notification_icon_path(result: &SearchResult) -> Option<PathBuf> {
+    if result.kind == MatchKind::Notification {
         icon_file_path(result.icon_name.as_deref())
     } else {
         None

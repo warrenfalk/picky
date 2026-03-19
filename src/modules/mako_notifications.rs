@@ -24,6 +24,7 @@ struct Notification {
     app_name: String,
     summary: String,
     body: String,
+    icon_name: Option<String>,
     urgency: u8,
 }
 
@@ -114,7 +115,7 @@ impl Module for MakoNotificationsModule {
                     item_id: notification.id.to_string(),
                     title: notification.summary,
                     subtitle,
-                    icon_name: None,
+                    icon_name: notification.icon_name.clone(),
                     kind: MatchKind::Notification,
                     actions: vec![
                         ResultAction {
@@ -221,6 +222,7 @@ fn parse_notification(value: Value) -> Option<Notification> {
         app_name: variant_string(map.get("app-name")).unwrap_or_default(),
         summary,
         body: variant_string(map.get("body")).unwrap_or_default(),
+        icon_name: variant_string(map.get("app-icon")).filter(|icon| !icon.trim().is_empty()),
         urgency: variant_u8(map.get("urgency")).unwrap_or(0),
     })
 }
@@ -311,8 +313,25 @@ mod tests {
             app_name: app_name.to_string(),
             summary: summary.to_string(),
             body: body.to_string(),
+            icon_name: None,
             urgency,
         }
+    }
+
+    #[test]
+    fn parse_notification_reads_app_icon() {
+        let value = serde_json::json!({
+            "id": { "data": 9 },
+            "summary": { "data": "Summary" },
+            "body": { "data": "Body" },
+            "app-name": { "data": "Mail" },
+            "app-icon": { "data": "/tmp/icon.png" },
+            "urgency": { "data": 1 }
+        });
+
+        let notification = parse_notification(value).unwrap();
+
+        assert_eq!(notification.icon_name.as_deref(), Some("/tmp/icon.png"));
     }
 
     #[test]
