@@ -2,9 +2,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+use crate::module::{
+    ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, ModuleRegistry, ResultAction, SearchResult,
+};
+use crate::modules;
 use iced::advanced::widget::{Operation, operate, operation::Outcome};
 use iced::event;
 use iced::keyboard::{self, Key, key::Named};
@@ -19,16 +22,12 @@ use iced::{
     Alignment, Background, Color, Element, Length, Rectangle, Shadow, Size, Subscription, Task,
     Theme, Vector, border, theme, window,
 };
-use serde::Deserialize;
-
-use crate::module::{
-    ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, ModuleRegistry, ResultAction, SearchResult,
-};
-use crate::modules;
 
 const WINDOW_WIDTH: f32 = 820.0;
-const DEFAULT_WINDOW_HEIGHT: f32 = 680.0;
-const WINDOW_HEIGHT_FRACTION: f32 = 0.7;
+// We intentionally start taller and avoid runtime `window::resize(...)`.
+// Resizing after the window opens appears to change the surface size without
+// recomputing layout, which is believed to be an Iced 0.14.0 bug.
+const DEFAULT_WINDOW_HEIGHT: f32 = 1368.0;
 const RESULT_ICON_SIZE: f32 = 28.0;
 const SUBTITLE_ICON_SIZE: f32 = 20.0;
 const RESULTS_SCROLL_MARGIN: f32 = 8.0;
@@ -66,6 +65,7 @@ enum Message {
     },
     KeyPressed(AppKey),
     SystemInfoLoaded(system::Information),
+    StartupFinished(StartupContext),
     SearchFinished {
         request_id: u64,
         result: Result<Vec<SearchResult>, String>,
@@ -74,7 +74,7 @@ enum Message {
 }
 
 pub struct PickerApp {
-    registry: Arc<Mutex<ModuleRegistry>>,
+    registry: Option<Arc<Mutex<ModuleRegistry>>>,
     query: String,
     error_message: String,
     renderer_warning: String,
@@ -88,23 +88,21 @@ pub struct PickerApp {
     results_viewport: Option<Viewport>,
     results_row_bounds: HashMap<Id, CachedRowBounds>,
     selected_result_visibility_request_id: u64,
+    is_starting_up: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct NiriOutput {
-    logical: NiriLogicalOutput,
+#[derive(Clone)]
+struct StartupContext {
+    registry: Arc<Mutex<ModuleRegistry>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct NiriLogicalOutput {
-    height: i32,
-}
-
-#[derive(Debug, Deserialize)]
-struct NiriWorkspaceInfo {
-    output: String,
-    #[serde(default)]
-    is_focused: bool,
+impl std::fmt::Debug for StartupContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StartupContext")
+            .field("registry", &"<module-registry>")
+            .finish()
+    }
 }
 
 pub fn run() -> iced::Result {
@@ -114,7 +112,7 @@ pub fn run() -> iced::Result {
         .theme(theme)
         .style(application_style)
         .window(window::Settings {
-            size: Size::new(WINDOW_WIDTH, initial_window_height()),
+            size: Size::new(WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT),
             position: window::Position::Centered,
             decorations: false,
             resizable: false,
@@ -152,8 +150,8 @@ fn application_style(_app: &PickerApp, _theme: &Theme) -> theme::Style {
 fn initialize() -> (PickerApp, Task<Message>) {
     let search_input_id = Id::unique();
     let results_scroll_id = Id::new("results-scroll");
-    let mut app = PickerApp {
-        registry: Arc::new(Mutex::new(ModuleRegistry::new(modules::default_modules()))),
+    let app = PickerApp {
+        registry: None,
         query: String::new(),
         error_message: String::new(),
         renderer_warning: String::new(),
@@ -167,12 +165,13 @@ fn initialize() -> (PickerApp, Task<Message>) {
         results_viewport: None,
         results_row_bounds: HashMap::new(),
         selected_result_visibility_request_id: 0,
+        is_starting_up: true,
     };
 
     let task = Task::batch([
         focus(app.search_input_id.clone()),
         system::information().map(Message::SystemInfoLoaded),
-        app.request_search(),
+        Task::perform(async { load_startup_context() }, Message::StartupFinished),
     ]);
 
     (app, task)
@@ -285,6 +284,11 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
                 tiny_skia_warning(&info).map_or_else(String::new, str::to_string);
             Task::none()
         }
+        Message::StartupFinished(startup) => {
+            app.is_starting_up = false;
+            app.registry = Some(startup.registry);
+            app.request_search()
+        }
         Message::KeyPressed(key) => match app.focus_target {
             FocusTarget::Search => app.handle_search_key(key),
             FocusTarget::Results => app.handle_results_key(key),
@@ -352,12 +356,22 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
         .style(search_input_style);
 
     let results_list: Element<'_, Message> = if app.results.is_empty() {
+        let (title, subtitle) = if app.is_starting_up {
+            (
+                "Loading results",
+                "Picker is starting up. You can type now and results will populate shortly.",
+            )
+        } else {
+            (
+                "No matches",
+                "Refine the query or switch focus with the arrow keys.",
+            )
+        };
+
         container(
             column![
-                text("No matches").size(22).color(theme_text()),
-                text("Refine the query or switch focus with the arrow keys.")
-                    .size(14)
-                    .color(theme_secondary_text()),
+                text(title).size(22).color(theme_text()),
+                text(subtitle).size(14).color(theme_secondary_text()),
             ]
             .spacing(6),
         )
@@ -744,12 +758,15 @@ fn cached_scroll_offset_for_row(viewport: Viewport, row_bounds: CachedRowBounds)
 
 impl PickerApp {
     fn request_search(&mut self) -> Task<Message> {
+        let Some(registry) = self.registry.as_ref().map(Arc::clone) else {
+            return Task::none();
+        };
+
         self.search_request_id += 1;
         self.active_search_request_id = self.search_request_id;
 
         let request_id = self.search_request_id;
         let query = self.query.clone();
-        let registry = Arc::clone(&self.registry);
 
         Task::perform(
             async move { search_registry(registry, &query) },
@@ -761,8 +778,10 @@ impl PickerApp {
         let Some(result) = self.selected_result().cloned() else {
             return Task::none();
         };
+        let Some(registry) = self.registry.as_ref().map(Arc::clone) else {
+            return Task::none();
+        };
 
-        let registry = Arc::clone(&self.registry);
         Task::perform(
             async move { activate_result(registry, result, action_id) },
             Message::ActivationFinished,
@@ -1252,65 +1271,10 @@ fn theme_error() -> Color {
     color_from_hex(0xE18497)
 }
 
-fn initial_window_height() -> f32 {
-    window_height_for_output_height(focused_output_height())
-}
-
-fn focused_output_height() -> Option<i32> {
-    let focused_output = load_focused_output_name()?;
-    let outputs = load_outputs().ok()?;
-
-    focused_output_height_for(&focused_output, &outputs)
-}
-
-fn focused_output_height_for(
-    focused_output: &str,
-    outputs: &HashMap<String, NiriOutput>,
-) -> Option<i32> {
-    outputs
-        .get(focused_output)
-        .map(|output| output.logical.height)
-        .or_else(|| outputs.values().next().map(|output| output.logical.height))
-}
-
-fn window_height_for_output_height(output_height: Option<i32>) -> f32 {
-    output_height
-        .map(|height| {
-            ((height as f32) * WINDOW_HEIGHT_FRACTION)
-                .round()
-                .max(360.0)
-        })
-        .unwrap_or(DEFAULT_WINDOW_HEIGHT)
-}
-
-fn load_focused_output_name() -> Option<String> {
-    let workspaces = Command::new("niri")
-        .args(["msg", "--json", "workspaces"])
-        .output()
-        .ok()?;
-
-    if !workspaces.status.success() {
-        return None;
+fn load_startup_context() -> StartupContext {
+    StartupContext {
+        registry: Arc::new(Mutex::new(ModuleRegistry::new(modules::default_modules()))),
     }
-
-    let workspaces: Vec<NiriWorkspaceInfo> = serde_json::from_slice(&workspaces.stdout).ok()?;
-    workspaces
-        .into_iter()
-        .find(|workspace| workspace.is_focused)
-        .map(|workspace| workspace.output)
-}
-
-fn load_outputs() -> Result<HashMap<String, NiriOutput>, serde_json::Error> {
-    let outputs = Command::new("niri")
-        .args(["msg", "--json", "outputs"])
-        .output()
-        .map_err(serde_json::Error::io)?;
-
-    if !outputs.status.success() {
-        return Ok(HashMap::new());
-    }
-
-    serde_json::from_slice(&outputs.stdout)
 }
 
 #[cfg(test)]
@@ -1319,7 +1283,7 @@ mod tests {
 
     fn app_with_results(results: Vec<SearchResult>) -> PickerApp {
         PickerApp {
-            registry: Arc::new(Mutex::new(ModuleRegistry::new(Vec::new()))),
+            registry: Some(Arc::new(Mutex::new(ModuleRegistry::new(Vec::new())))),
             query: String::new(),
             error_message: String::new(),
             renderer_warning: String::new(),
@@ -1333,6 +1297,7 @@ mod tests {
             results_viewport: None,
             results_row_bounds: HashMap::new(),
             selected_result_visibility_request_id: 0,
+            is_starting_up: false,
         }
     }
 
@@ -1357,6 +1322,39 @@ mod tests {
 
         assert_eq!(app.query, "fire");
         assert_eq!(app.focus_target, FocusTarget::Search);
+        assert_eq!(app.search_request_id, 1);
+        assert_eq!(app.active_search_request_id, 1);
+    }
+
+    #[test]
+    fn query_changed_while_starting_up_defers_search_until_registry_is_ready() {
+        let mut app = app_with_results(Vec::new());
+        app.registry = None;
+        app.is_starting_up = true;
+
+        let _ = update(&mut app, Message::QueryChanged("fire".to_string()));
+
+        assert_eq!(app.query, "fire");
+        assert_eq!(app.search_request_id, 0);
+        assert_eq!(app.active_search_request_id, 0);
+    }
+
+    #[test]
+    fn startup_finished_marks_ready_and_requests_search_for_current_query() {
+        let mut app = app_with_results(Vec::new());
+        app.registry = None;
+        app.is_starting_up = true;
+        app.query = "fire".to_string();
+
+        let _ = update(
+            &mut app,
+            Message::StartupFinished(StartupContext {
+                registry: Arc::new(Mutex::new(ModuleRegistry::new(Vec::new()))),
+            }),
+        );
+
+        assert!(!app.is_starting_up);
+        assert!(app.registry.is_some());
         assert_eq!(app.search_request_id, 1);
         assert_eq!(app.active_search_request_id, 1);
     }
@@ -1552,32 +1550,5 @@ mod tests {
         );
 
         assert!(app.renderer_warning.is_empty());
-    }
-
-    #[test]
-    fn focused_output_height_prefers_focused_output() {
-        let outputs = HashMap::from([
-            (
-                "DP-1".to_string(),
-                NiriOutput {
-                    logical: NiriLogicalOutput { height: 1000 },
-                },
-            ),
-            (
-                "DP-2".to_string(),
-                NiriOutput {
-                    logical: NiriLogicalOutput { height: 2000 },
-                },
-            ),
-        ]);
-
-        assert_eq!(focused_output_height_for("DP-2", &outputs), Some(2000));
-    }
-
-    #[test]
-    fn window_height_uses_fraction_and_clamp() {
-        assert_eq!(window_height_for_output_height(Some(1000)), 700.0);
-        assert_eq!(window_height_for_output_height(Some(100)), 360.0);
-        assert_eq!(window_height_for_output_height(None), DEFAULT_WINDOW_HEIGHT);
     }
 }
