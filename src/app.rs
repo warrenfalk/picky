@@ -45,8 +45,10 @@ enum FocusTarget {
 enum AppKey {
     Down,
     Up,
+    Tab,
     Enter,
     Escape,
+    FocusSearch,
     Shortcut(char),
 }
 
@@ -211,6 +213,7 @@ fn results_event_message(
 fn search_key_message(key: Key, _modifiers: keyboard::Modifiers) -> Option<Message> {
     match key {
         Key::Named(Named::ArrowDown) => Some(Message::KeyPressed(AppKey::Down)),
+        Key::Named(Named::Tab) => Some(Message::KeyPressed(AppKey::Tab)),
         Key::Named(Named::Escape) => Some(Message::KeyPressed(AppKey::Escape)),
         _ => None,
     }
@@ -220,8 +223,10 @@ fn results_key_message(key: Key, _modifiers: keyboard::Modifiers) -> Option<Mess
     match key {
         Key::Named(Named::ArrowDown) => Some(Message::KeyPressed(AppKey::Down)),
         Key::Named(Named::ArrowUp) => Some(Message::KeyPressed(AppKey::Up)),
+        Key::Named(Named::Tab) => Some(Message::KeyPressed(AppKey::Tab)),
         Key::Named(Named::Enter) => Some(Message::KeyPressed(AppKey::Enter)),
         Key::Named(Named::Escape) => Some(Message::KeyPressed(AppKey::Escape)),
+        Key::Character(value) if value == "/" => Some(Message::KeyPressed(AppKey::FocusSearch)),
         Key::Character(value) => value
             .chars()
             .next()
@@ -795,9 +800,9 @@ impl PickerApp {
 
     fn handle_search_key(&mut self, key: AppKey) -> Task<Message> {
         match key {
-            AppKey::Down if !self.results.is_empty() => {
+            AppKey::Down | AppKey::Tab if !self.results.is_empty() => {
                 self.focus_target = FocusTarget::Results;
-                self.selected_index = Some(0);
+                self.selected_index.get_or_insert(0);
                 Task::batch([
                     focus_first_result(&self.search_input_id),
                     self.schedule_selected_result_scroll(),
@@ -840,6 +845,14 @@ impl PickerApp {
                     self.schedule_selected_result_scroll()
                 }
             },
+            AppKey::Tab => {
+                self.focus_target = FocusTarget::Search;
+                focus(self.search_input_id.clone())
+            }
+            AppKey::FocusSearch => {
+                self.focus_target = FocusTarget::Search;
+                focus(self.search_input_id.clone())
+            }
             AppKey::Enter => self.activate_selected(DEFAULT_ACTION_ID),
             AppKey::Escape => iced::exit(),
             AppKey::Shortcut(shortcut) => self
@@ -1370,6 +1383,16 @@ mod tests {
     }
 
     #[test]
+    fn tab_from_search_moves_focus_to_results() {
+        let mut app = app_with_results(vec![result("Firefox", Vec::new())]);
+
+        let _ = app.handle_search_key(AppKey::Tab);
+
+        assert_eq!(app.focus_target, FocusTarget::Results);
+        assert_eq!(app.selected_index, Some(0));
+    }
+
+    #[test]
     fn down_and_up_move_results_selection() {
         let mut app = app_with_results(vec![
             result("Firefox", Vec::new()),
@@ -1391,6 +1414,30 @@ mod tests {
         app.selected_index = Some(0);
 
         let _ = app.handle_results_key(AppKey::Up);
+
+        assert_eq!(app.focus_target, FocusTarget::Search);
+        assert_eq!(app.selected_index, Some(0));
+    }
+
+    #[test]
+    fn slash_from_results_returns_focus_to_search() {
+        let mut app = app_with_results(vec![result("Firefox", Vec::new())]);
+        app.focus_target = FocusTarget::Results;
+        app.selected_index = Some(0);
+
+        let _ = app.handle_results_key(AppKey::FocusSearch);
+
+        assert_eq!(app.focus_target, FocusTarget::Search);
+        assert_eq!(app.selected_index, Some(0));
+    }
+
+    #[test]
+    fn tab_from_results_returns_focus_to_search() {
+        let mut app = app_with_results(vec![result("Firefox", Vec::new())]);
+        app.focus_target = FocusTarget::Results;
+        app.selected_index = Some(0);
+
+        let _ = app.handle_results_key(AppKey::Tab);
 
         assert_eq!(app.focus_target, FocusTarget::Search);
         assert_eq!(app.selected_index, Some(0));
