@@ -1,4 +1,32 @@
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WeightedField<'a> {
+    pub text: &'a str,
+    pub bonus: i64,
+    pub weight_num: i64,
+    pub weight_den: i64,
+}
+
+impl<'a> WeightedField<'a> {
+    pub const fn new(text: &'a str, bonus: i64, weight_num: i64, weight_den: i64) -> Self {
+        Self {
+            text,
+            bonus,
+            weight_num,
+            weight_den,
+        }
+    }
+}
+
 pub fn score_fields(query: &str, fields: &[(&str, i64)]) -> Option<i64> {
+    let weighted_fields = fields
+        .iter()
+        .map(|(text, bonus)| WeightedField::new(text, *bonus, 1, 1))
+        .collect::<Vec<_>>();
+
+    score_weighted_fields(query, &weighted_fields)
+}
+
+pub fn score_weighted_fields(query: &str, fields: &[WeightedField<'_>]) -> Option<i64> {
     let terms = split_terms(query);
     if terms.is_empty() {
         return Some(0);
@@ -9,11 +37,13 @@ pub fn score_fields(query: &str, fields: &[(&str, i64)]) -> Option<i64> {
     for term in terms {
         let mut term_matches = fields
             .iter()
-            .filter_map(|(field, bonus)| {
-                let term_match = score_term(&term, field)?;
+            .filter_map(|field| {
+                let term_match = score_term(&term, field.text)?;
+                let weight_den = field.weight_den.max(1);
                 Some((
-                    term_match.score + bonus,
-                    term_match.echo_bonus + (*bonus).max(0) / 10,
+                    (term_match.score + field.bonus) * field.weight_num / weight_den,
+                    (term_match.echo_bonus + field.bonus.max(0) / 10) * field.weight_num
+                        / weight_den,
                 ))
             })
             .collect::<Vec<_>>();
@@ -148,7 +178,7 @@ fn char_position(haystack: &str, byte_index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{score, score_fields};
+    use super::{WeightedField, score, score_fields, score_weighted_fields};
 
     #[test]
     fn empty_query_matches_with_zero_score() {
@@ -184,5 +214,27 @@ mod tests {
         let single = score_fields("fox", &[("Fox", 0)]).unwrap();
         let multiple = score_fields("fox", &[("Fox", 0), ("Firefox", 0)]).unwrap();
         assert!(multiple > single);
+    }
+
+    #[test]
+    fn weighted_fields_allow_identity_matches_to_beat_title_matches() {
+        let app_name_match = score_weighted_fields(
+            "firefox",
+            &[
+                WeightedField::new("Firefox", 110, 3, 2),
+                WeightedField::new("Scratchpad", 120, 1, 2),
+            ],
+        )
+        .unwrap();
+        let title_only_match = score_weighted_fields(
+            "firefox",
+            &[
+                WeightedField::new("WezTerm", 110, 3, 2),
+                WeightedField::new("Firefox docs", 120, 1, 2),
+            ],
+        )
+        .unwrap();
+
+        assert!(app_name_match > title_only_match);
     }
 }

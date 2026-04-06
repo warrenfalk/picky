@@ -7,9 +7,11 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::fuzzy;
+use crate::fuzzy::WeightedField;
 use crate::module::{
     ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, ResultAction, SearchResult,
 };
+use crate::modules::applications::ApplicationMetadata;
 
 const MODULE_KEY: &str = "niri-windows";
 const CLOSE_ACTION_ID: &str = "close";
@@ -19,7 +21,7 @@ const CLOSE_POLL_TIMEOUT: Duration = Duration::from_millis(750);
 const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct NiriWindowsModule {
-    icon_index: HashMap<String, String>,
+    application_index: HashMap<String, ApplicationMetadata>,
     backend: Box<dyn WindowsBackend>,
 }
 
@@ -86,20 +88,79 @@ impl WindowsBackend for ProcessWindowsBackend {
 
 impl NiriWindowsModule {
     pub fn new() -> Self {
-        let icon_index = crate::modules::applications::load_icon_index().unwrap_or_else(|err| {
-            eprintln!("failed to load application icon index: {err:#}");
-            HashMap::new()
-        });
+        let application_index = crate::modules::applications::load_application_index()
+            .unwrap_or_else(|err| {
+                eprintln!("failed to load application index: {err:#}");
+                HashMap::new()
+            });
 
-        Self::with_backend(icon_index, Box::new(ProcessWindowsBackend))
+        Self::with_backend(application_index, Box::new(ProcessWindowsBackend))
     }
 
-    fn with_backend(icon_index: HashMap<String, String>, backend: Box<dyn WindowsBackend>) -> Self {
+    fn with_backend(
+        application_index: HashMap<String, ApplicationMetadata>,
+        backend: Box<dyn WindowsBackend>,
+    ) -> Self {
         Self {
-            icon_index,
+            application_index,
             backend,
         }
     }
+}
+
+fn score_window(
+    query: &str,
+    application_name: &str,
+    app_id: &str,
+    title: &str,
+    workspace_label: &str,
+    output_name: &str,
+) -> Option<i64> {
+    fuzzy::score_weighted_fields(
+        query,
+        &[
+            WeightedField::new(application_name, 110, 3, 2),
+            WeightedField::new(app_id, 70, 1, 1),
+            WeightedField::new(title, 120, 1, 2),
+            WeightedField::new(workspace_label, 30, 1, 4),
+            WeightedField::new(output_name, 20, 1, 4),
+        ],
+    )
+}
+
+fn application_for_app_id<'a>(
+    application_index: &'a HashMap<String, ApplicationMetadata>,
+    app_id: &str,
+) -> Option<&'a ApplicationMetadata> {
+    let app_id = app_id.trim();
+    if app_id.is_empty() {
+        return None;
+    }
+
+    if let Some(application) = application_index.get(app_id) {
+        return Some(application);
+    }
+
+    let desktop_id = format!("{app_id}.desktop");
+    application_index.get(&desktop_id)
+}
+
+fn application_label_for_window<'a>(
+    application_index: &'a HashMap<String, ApplicationMetadata>,
+    app_id: &'a str,
+) -> &'a str {
+    application_for_app_id(application_index, app_id)
+        .map(|application| application.name.trim())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| app_id.trim())
+}
+
+fn icon_name_for_app_id(
+    application_index: &HashMap<String, ApplicationMetadata>,
+    app_id: &str,
+) -> Option<String> {
+    application_for_app_id(application_index, app_id)
+        .and_then(|application| application.icon_name.clone())
 }
 
 impl Module for NiriWindowsModule {
@@ -131,20 +192,21 @@ impl Module for NiriWindowsModule {
                 let output_name = workspace
                     .map(|workspace| workspace.output.as_str())
                     .unwrap_or("unknown output");
-                let score = fuzzy::score_fields(
+                let application_label =
+                    application_label_for_window(&self.application_index, &window.app_id);
+                let score = score_window(
                     query,
-                    &[
-                        (&window.title, 120),
-                        (&window.app_id, 70),
-                        (&workspace_label, 30),
-                        (output_name, 20),
-                    ],
+                    application_label,
+                    &window.app_id,
+                    &window.title,
+                    &workspace_label,
+                    output_name,
                 )?;
 
-                let subtitle = if window.app_id.is_empty() {
+                let subtitle = if application_label.is_empty() {
                     format!("{workspace_label} on {output_name}")
                 } else {
-                    format!("{}  {} on {}", window.app_id, workspace_label, output_name)
+                    format!("{application_label}  {workspace_label} on {output_name}")
                 };
 
                 Some(SearchResult {
@@ -152,7 +214,7 @@ impl Module for NiriWindowsModule {
                     item_id: encode_window_target(window.id, window.pid),
                     title: window.title,
                     subtitle,
-                    icon_name: icon_name_for_app_id(&self.icon_index, &window.app_id),
+                    icon_name: icon_name_for_app_id(&self.application_index, &window.app_id),
                     kind: MatchKind::Window,
                     actions: vec![
                         ResultAction {
@@ -363,21 +425,6 @@ fn load_workspaces() -> Result<Vec<NiriWorkspace>> {
     serde_json::from_slice(&output.stdout).context("failed to parse niri workspaces JSON")
 }
 
-fn icon_name_for_app_id(icon_index: &HashMap<String, String>, app_id: &str) -> Option<String> {
-    let app_id = app_id.trim();
-    if app_id.is_empty() {
-        return None;
-    }
-
-    icon_index
-        .get(app_id)
-        .or_else(|| {
-            let desktop_id = format!("{app_id}.desktop");
-            icon_index.get(&desktop_id)
-        })
-        .cloned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +517,13 @@ mod tests {
         }
     }
 
+    fn application(name: &str) -> ApplicationMetadata {
+        ApplicationMetadata {
+            name: name.to_string(),
+            icon_name: None,
+        }
+    }
+
     #[test]
     fn search_exposes_close_terminate_and_kill_actions() {
         let state = Arc::new(Mutex::new(FakeState {
@@ -486,6 +540,50 @@ mod tests {
         assert_eq!(results[0].actions[0].id, CLOSE_ACTION_ID);
         assert_eq!(results[0].actions[1].id, TERMINATE_ACTION_ID);
         assert_eq!(results[0].actions[2].id, KILL_ACTION_ID);
+    }
+
+    #[test]
+    fn search_prefers_application_name_matches_over_title_matches() {
+        let state = Arc::new(Mutex::new(FakeState {
+            windows: vec![
+                window(1, "Project notes", "firefox", Some(111), 10),
+                window(2, "Firefox docs", "wezterm", Some(222), 10),
+            ],
+            workspaces: vec![workspace(10, 2, Some("code"), "DP-1")],
+            ..FakeState::default()
+        }));
+        let mut module = NiriWindowsModule::with_backend(
+            HashMap::from([
+                ("firefox".to_string(), application("Firefox")),
+                ("wezterm".to_string(), application("WezTerm")),
+            ]),
+            Box::new(FakeWindowsBackend { state }),
+        );
+
+        let results = module.search("firefox").unwrap();
+
+        assert_eq!(results[0].title, "Project notes");
+        assert_eq!(results[0].subtitle, "Firefox  code on DP-1");
+        assert_eq!(results[1].title, "Firefox docs");
+    }
+
+    #[test]
+    fn search_uses_resolved_application_name_for_matching() {
+        let state = Arc::new(Mutex::new(FakeState {
+            windows: vec![window(1, "Project notes", "Navigator", Some(111), 10)],
+            workspaces: vec![workspace(10, 2, Some("code"), "DP-1")],
+            ..FakeState::default()
+        }));
+        let mut module = NiriWindowsModule::with_backend(
+            HashMap::from([("Navigator.desktop".to_string(), application("Firefox"))]),
+            Box::new(FakeWindowsBackend { state }),
+        );
+
+        let results = module.search("firefox").unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Project notes");
+        assert_eq!(results[0].subtitle, "Firefox  code on DP-1");
     }
 
     #[test]

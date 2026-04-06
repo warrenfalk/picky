@@ -88,3 +88,64 @@ impl ModuleRegistry {
         module.activate(&result.item_id, action_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeModule {
+        key: &'static str,
+        results: Vec<SearchResult>,
+    }
+
+    impl Module for FakeModule {
+        fn key(&self) -> &'static str {
+            self.key
+        }
+
+        fn search(&mut self, _query: &str) -> Result<Vec<SearchResult>> {
+            Ok(self.results.clone())
+        }
+
+        fn activate(&mut self, _item_id: &str, _action_id: &str) -> Result<ActivationOutcome> {
+            Ok(ActivationOutcome::ClosePicker)
+        }
+    }
+
+    fn result(module_key: &'static str, kind: MatchKind, title: &str, score: i64) -> SearchResult {
+        SearchResult {
+            module_key,
+            item_id: title.to_string(),
+            title: title.to_string(),
+            subtitle: String::new(),
+            icon_name: None,
+            kind,
+            actions: Vec::new(),
+            score,
+        }
+    }
+
+    #[test]
+    fn search_prefers_applications_when_scores_tie() {
+        let mut registry = ModuleRegistry::new(vec![
+            Box::new(FakeModule {
+                key: "applications",
+                results: vec![result(
+                    "applications",
+                    MatchKind::Application,
+                    "Firefox",
+                    300,
+                )],
+            }),
+            Box::new(FakeModule {
+                key: "niri-windows",
+                results: vec![result("niri-windows", MatchKind::Window, "Firefox", 300)],
+            }),
+        ]);
+
+        let results = registry.search("firefox").unwrap();
+
+        assert_eq!(results[0].kind, MatchKind::Application);
+        assert_eq!(results[1].kind, MatchKind::Window);
+    }
+}

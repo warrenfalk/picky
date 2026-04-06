@@ -16,6 +16,12 @@ pub struct ApplicationsModule {
     launcher: Box<dyn ApplicationLauncher>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApplicationMetadata {
+    pub name: String,
+    pub icon_name: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct ApplicationEntry {
     id: String,
@@ -64,29 +70,38 @@ impl ApplicationsModule {
     }
 }
 
-pub fn load_icon_index() -> Result<HashMap<String, String>> {
-    let mut icons = HashMap::new();
-
-    for entry in load_entries()? {
-        let Some(icon_name) = entry.icon_name.clone().filter(|icon| !icon.is_empty()) else {
-            continue;
-        };
-
-        insert_icon_aliases(&mut icons, &entry.id, &icon_name);
-    }
-
-    Ok(icons)
+pub fn load_application_index() -> Result<HashMap<String, ApplicationMetadata>> {
+    Ok(build_application_index(load_entries()?))
 }
 
-fn insert_icon_aliases(icons: &mut HashMap<String, String>, desktop_id: &str, icon_name: &str) {
-    icons
+fn build_application_index(entries: Vec<ApplicationEntry>) -> HashMap<String, ApplicationMetadata> {
+    let mut applications = HashMap::new();
+
+    for entry in entries {
+        insert_application_aliases(
+            &mut applications,
+            &entry.id,
+            ApplicationMetadata {
+                name: entry.name,
+                icon_name: entry.icon_name.filter(|icon| !icon.is_empty()),
+            },
+        );
+    }
+
+    applications
+}
+
+fn insert_application_aliases(
+    applications: &mut HashMap<String, ApplicationMetadata>,
+    desktop_id: &str,
+    metadata: ApplicationMetadata,
+) {
+    applications
         .entry(desktop_id.to_string())
-        .or_insert_with(|| icon_name.to_string());
+        .or_insert_with(|| metadata.clone());
 
     if let Some(stripped) = desktop_id.strip_suffix(".desktop") {
-        icons
-            .entry(stripped.to_string())
-            .or_insert_with(|| icon_name.to_string());
+        applications.entry(stripped.to_string()).or_insert(metadata);
     }
 }
 
@@ -412,6 +427,31 @@ mod tests {
 
         assert_eq!(results[0].title, "Firefox");
         assert_eq!(results[0].module_key, MODULE_KEY);
+    }
+
+    #[test]
+    fn build_application_index_adds_stripped_desktop_aliases() {
+        let applications = build_application_index(vec![entry(
+            "org.mozilla.Firefox.desktop",
+            "Firefox",
+            "Web Browser",
+            "browser web",
+        )]);
+
+        assert_eq!(
+            applications.get("org.mozilla.Firefox.desktop"),
+            Some(&ApplicationMetadata {
+                name: "Firefox".to_string(),
+                icon_name: None,
+            })
+        );
+        assert_eq!(
+            applications.get("org.mozilla.Firefox"),
+            Some(&ApplicationMetadata {
+                name: "Firefox".to_string(),
+                icon_name: None,
+            })
+        );
     }
 
     #[test]
