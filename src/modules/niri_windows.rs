@@ -42,6 +42,8 @@ struct NiriWorkspace {
     idx: u64,
     name: Option<String>,
     output: String,
+    #[serde(default)]
+    is_focused: bool,
 }
 
 trait WindowsBackend: Send {
@@ -209,43 +211,47 @@ impl Module for NiriWindowsModule {
                     format!("{application_label}  {workspace_label} on {output_name}")
                 };
 
-                Some(SearchResult {
-                    module_key: MODULE_KEY,
-                    item_id: encode_window_target(window.id, window.pid),
-                    title: window.title,
-                    subtitle,
-                    icon_name: icon_name_for_app_id(&self.application_index, &window.app_id),
-                    kind: MatchKind::Window,
-                    actions: vec![
-                        ResultAction {
-                            id: CLOSE_ACTION_ID,
-                            label: "close",
-                            shortcut: 'q',
-                        },
-                        ResultAction {
-                            id: TERMINATE_ACTION_ID,
-                            label: "terminate",
-                            shortcut: 't',
-                        },
-                        ResultAction {
-                            id: KILL_ACTION_ID,
-                            label: "kill",
-                            shortcut: 'k',
-                        },
-                    ],
-                    score,
-                })
+                Some((
+                    SearchResult {
+                        module_key: MODULE_KEY,
+                        item_id: encode_window_target(window.id, window.pid),
+                        title: window.title,
+                        subtitle,
+                        icon_name: icon_name_for_app_id(&self.application_index, &window.app_id),
+                        kind: MatchKind::Window,
+                        actions: vec![
+                            ResultAction {
+                                id: CLOSE_ACTION_ID,
+                                label: "close",
+                                shortcut: 'q',
+                            },
+                            ResultAction {
+                                id: TERMINATE_ACTION_ID,
+                                label: "terminate",
+                                shortcut: 't',
+                            },
+                            ResultAction {
+                                id: KILL_ACTION_ID,
+                                label: "kill",
+                                shortcut: 'k',
+                            },
+                        ],
+                        score,
+                    },
+                    workspace.is_some_and(|workspace| workspace.is_focused),
+                ))
             })
             .collect::<Vec<_>>();
 
-        results.sort_by(|left, right| {
+        results.sort_by(|(left, left_focused), (right, right_focused)| {
             right
                 .score
                 .cmp(&left.score)
+                .then_with(|| right_focused.cmp(left_focused))
                 .then_with(|| left.title.cmp(&right.title))
         });
 
-        Ok(results)
+        Ok(results.into_iter().map(|(result, _)| result).collect())
     }
 
     fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome> {
@@ -514,6 +520,14 @@ mod tests {
             idx,
             name: name.map(ToOwned::to_owned),
             output: output.to_string(),
+            is_focused: false,
+        }
+    }
+
+    fn focused_workspace(id: u64, idx: u64, name: Option<&str>, output: &str) -> NiriWorkspace {
+        NiriWorkspace {
+            is_focused: true,
+            ..workspace(id, idx, name, output)
         }
     }
 
@@ -584,6 +598,56 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Project notes");
         assert_eq!(results[0].subtitle, "Firefox  code on DP-1");
+    }
+
+    #[test]
+    fn search_prefers_focused_workspace_when_matches_are_otherwise_equal() {
+        let state = Arc::new(Mutex::new(FakeState {
+            windows: vec![
+                window(1, "Project notes", "firefox", Some(111), 10),
+                window(2, "Project notes", "firefox", Some(222), 20),
+            ],
+            workspaces: vec![
+                focused_workspace(10, 2, Some("code"), "DP-1"),
+                workspace(20, 3, Some("chat"), "DP-2"),
+            ],
+            ..FakeState::default()
+        }));
+        let mut module = NiriWindowsModule::with_backend(
+            HashMap::from([("firefox".to_string(), application("Firefox"))]),
+            Box::new(FakeWindowsBackend { state }),
+        );
+
+        let results = module.search("firefox").unwrap();
+
+        assert_eq!(results[0].item_id, "1:111");
+        assert_eq!(results[1].item_id, "2:222");
+        assert_eq!(results[0].score, results[1].score);
+    }
+
+    #[test]
+    fn search_keeps_better_match_above_focused_workspace_bonus() {
+        let state = Arc::new(Mutex::new(FakeState {
+            windows: vec![
+                window(1, "Firefox docs", "wezterm", Some(111), 10),
+                window(2, "Firefox", "wezterm", Some(222), 20),
+            ],
+            workspaces: vec![
+                focused_workspace(10, 2, Some("code"), "DP-1"),
+                workspace(20, 3, Some("chat"), "DP-2"),
+            ],
+            ..FakeState::default()
+        }));
+        let mut module = NiriWindowsModule::with_backend(
+            HashMap::from([("wezterm".to_string(), application("WezTerm"))]),
+            Box::new(FakeWindowsBackend { state }),
+        );
+
+        let results = module.search("firefox").unwrap();
+
+        assert_eq!(results[0].item_id, "2:222");
+        assert_eq!(results[1].item_id, "1:111");
+        assert!(results[0].score > results[1].score);
     }
 
     #[test]
