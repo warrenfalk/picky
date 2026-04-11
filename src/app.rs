@@ -17,8 +17,8 @@ use iced::system;
 use iced::widget::operation::{AbsoluteOffset, focus, focus_next, scroll_to};
 use iced::widget::scrollable::Viewport;
 use iced::widget::{
-    Id, button, column, container, image, keyed_column, lazy, mouse_area, row, scrollable, svg,
-    text, text_input,
+    Id, button, column, container, image, keyed_column, lazy, row, scrollable, svg, text,
+    text_input,
 };
 use iced::{
     Alignment, Background, Color, Element, Length, Rectangle, Shadow, Size, Subscription, Task,
@@ -59,7 +59,6 @@ enum Message {
     QueryChanged(String),
     ActivateSelected,
     ActivateSelectedAction(&'static str),
-    ResultSelected(usize),
     ResultActivated(usize),
     ResultsScrolled(Viewport),
     EnsureSelectedResultVisible(u64),
@@ -252,11 +251,6 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
         }
         Message::ActivateSelected => app.activate_selected(DEFAULT_ACTION_ID),
         Message::ActivateSelectedAction(action_id) => app.activate_selected(action_id),
-        Message::ResultSelected(index) => {
-            app.selected_index = Some(index);
-            app.focus_target = FocusTarget::Results;
-            app.schedule_selected_result_scroll()
-        }
         Message::ResultActivated(index) => {
             app.selected_index = Some(index);
             app.focus_target = FocusTarget::Results;
@@ -548,18 +542,15 @@ fn view_result_row(row_state: &ResultRowView) -> Element<'static, Message> {
     .spacing(12)
     .width(Length::Fill);
 
-    mouse_area(
-        container(
-            button(container(row_content).width(Length::Fill))
-                .width(Length::Fill)
-                .padding(12)
-                .style(move |theme, status| result_row_button_style(theme, status, is_selected))
-                .on_press(Message::ResultSelected(index)),
-        )
-        .id(row_id)
-        .width(Length::Fill),
+    container(
+        button(container(row_content).width(Length::Fill))
+            .width(Length::Fill)
+            .padding(12)
+            .style(move |theme, status| result_row_button_style(theme, status, is_selected))
+            .on_press(Message::ResultActivated(index)),
     )
-    .on_double_click(Message::ResultActivated(index))
+    .id(row_id)
+    .width(Length::Fill)
     .into()
 }
 
@@ -1712,6 +1703,21 @@ mod tests {
 
         assert_eq!(app.selected_action_id_for_shortcut('q'), Some("close"));
         assert_eq!(app.selected_action_id_for_shortcut('Q'), Some("close"));
+    }
+
+    #[test]
+    fn result_activated_updates_selection_and_focus() {
+        let mut app = app_with_results(vec![
+            result("Firefox", Vec::new()),
+            result("Calculator", Vec::new()),
+        ]);
+        app.focus_target = FocusTarget::Search;
+        app.selected_index = Some(0);
+
+        let _ = update(&mut app, Message::ResultActivated(1));
+
+        assert_eq!(app.selected_index, Some(1));
+        assert_eq!(app.focus_target, FocusTarget::Results);
     }
 
     #[test]
