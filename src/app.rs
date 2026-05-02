@@ -3,13 +3,19 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::module::{
     ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, ModuleRegistry, ResultAction, SearchResult,
 };
 use crate::modules;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use iced::advanced::widget::{Operation, operate, operation::Outcome};
 use iced::event;
 use iced::keyboard::{self, Key, key::Named};
@@ -24,6 +30,8 @@ use iced::{
     Alignment, Background, Color, Element, Length, Rectangle, Shadow, Size, Subscription, Task,
     Theme, Vector, border, theme, window,
 };
+use serde::Deserialize;
+use serde_json::json;
 
 const WINDOW_WIDTH: f32 = 820.0;
 // We intentionally start taller and avoid runtime `window::resize(...)`.
@@ -32,6 +40,13 @@ const WINDOW_WIDTH: f32 = 820.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 1368.0;
 const RESULT_ICON_SIZE: f32 = 28.0;
 const SUBTITLE_ICON_SIZE: f32 = 20.0;
+const WINDOW_THUMBNAIL_WIDTH: f32 = 96.0;
+const WINDOW_THUMBNAIL_HEIGHT: f32 = 60.0;
+const WINDOW_THUMBNAIL_MAX_WIDTH: u32 = 256;
+const WINDOW_THUMBNAIL_MAX_HEIGHT: u32 = 160;
+const WINDOW_THUMBNAIL_OVERSCAN: f32 = 160.0;
+const NIRI_THUMBNAIL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_WINDOW_THUMBNAIL_REQUESTS_PER_BATCH: usize = 6;
 const RESULTS_SCROLL_MARGIN: f32 = 8.0;
 const SHELL_RADIUS: f32 = 28.0;
 const CARD_RADIUS: f32 = 16.0;
@@ -74,6 +89,10 @@ enum Message {
         request_id: u64,
         result: Result<Vec<SearchResult>, String>,
     },
+    WindowThumbnailFinished {
+        window_id: u64,
+        result: Result<LoadedWindowThumbnail, String>,
+    },
     ActivationFinished(Result<ActivationOutcome, String>),
 }
 
@@ -92,6 +111,8 @@ pub struct PickerApp {
     results_scroll_id: Id,
     results_viewport: Option<Viewport>,
     results_row_bounds: HashMap<Id, CachedRowBounds>,
+    visible_result_row_ids: HashSet<Id>,
+    window_thumbnails: HashMap<u64, WindowThumbnailState>,
     selected_result_visibility_request_id: u64,
     is_starting_up: bool,
     is_loading_icon_index: bool,
@@ -109,6 +130,36 @@ impl std::fmt::Debug for StartupContext {
             .field("registry", &"<module-registry>")
             .finish()
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WindowThumbnailState {
+    Loading,
+    Ready(PathBuf),
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoadedWindowThumbnail {
+    window_id: u64,
+    path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+enum NiriIpcReply {
+    Ok(NiriIpcResponse),
+    Err(String),
+}
+
+#[derive(Debug, Deserialize)]
+enum NiriIpcResponse {
+    WindowThumbnail(NiriWindowThumbnail),
+}
+
+#[derive(Debug, Deserialize)]
+struct NiriWindowThumbnail {
+    id: u64,
+    png_base64: String,
 }
 
 pub fn run() -> iced::Result {
@@ -171,6 +222,8 @@ fn initialize() -> (PickerApp, Task<Message>) {
         results_scroll_id,
         results_viewport: None,
         results_row_bounds: HashMap::new(),
+        visible_result_row_ids: HashSet::new(),
+        window_thumbnails: HashMap::new(),
         selected_result_visibility_request_id: 0,
         is_starting_up: true,
         is_loading_icon_index: false,
@@ -258,7 +311,8 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
         }
         Message::ResultsScrolled(viewport) => {
             app.results_viewport = Some(viewport);
-            Task::none()
+            app.visible_result_row_ids = app.visible_result_row_ids_for_viewport(viewport);
+            app.request_visible_window_thumbnails()
         }
         Message::EnsureSelectedResultVisible(request_id) => {
             app.measure_selected_result_visibility(request_id)
@@ -272,8 +326,9 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
             }
 
             app.results_row_bounds = measured.row_bounds;
+            app.visible_result_row_ids = measured.visible_row_ids.into_iter().collect();
 
-            measured
+            let scroll_task = measured
                 .target_offset_y
                 .map_or_else(Task::none, |offset_y| {
                     scroll_to(
@@ -283,7 +338,10 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
                             y: offset_y,
                         },
                     )
-                })
+                });
+            let thumbnail_task = app.request_visible_window_thumbnails();
+
+            Task::batch([scroll_task, thumbnail_task])
         }
         Message::SystemInfoLoaded(info) => {
             app.renderer_warning =
@@ -313,6 +371,8 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
                 Ok(results) => {
                     app.error_message.clear();
                     app.results = results;
+                    app.results_row_bounds.clear();
+                    app.visible_result_row_ids.clear();
                     app.selected_index = (!app.results.is_empty()).then_some(0);
                     let icon_index_task = app.request_icon_index();
 
@@ -347,6 +407,29 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
                     }
                 }
             }
+        }
+        Message::WindowThumbnailFinished { window_id, result } => {
+            match result {
+                Ok(thumbnail) if thumbnail.window_id == window_id => {
+                    app.window_thumbnails
+                        .insert(window_id, WindowThumbnailState::Ready(thumbnail.path));
+                }
+                Ok(thumbnail) => {
+                    eprintln!(
+                        "niri returned thumbnail for window {}, expected {window_id}",
+                        thumbnail.window_id
+                    );
+                    app.window_thumbnails
+                        .insert(window_id, WindowThumbnailState::Failed);
+                }
+                Err(error) => {
+                    eprintln!("failed to load thumbnail for window {window_id}: {error}");
+                    app.window_thumbnails
+                        .insert(window_id, WindowThumbnailState::Failed);
+                }
+            }
+
+            app.request_visible_window_thumbnails()
         }
         Message::ActivationFinished(result) => match result {
             Ok(ActivationOutcome::ClosePicker) => iced::exit(),
@@ -404,6 +487,10 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
                     icon_path: resolve_icon_path(
                         result.icon_name.as_deref(),
                         app.icon_index.as_deref(),
+                    ),
+                    window_thumbnail_path: window_thumbnail_path_for_result(
+                        result,
+                        &app.window_thumbnails,
                     ),
                     is_selected: app.selected_index == Some(index),
                     show_action_hints: app.selected_index == Some(index)
@@ -473,6 +560,7 @@ struct ResultRowView {
     index: usize,
     result: SearchResult,
     icon_path: Option<PathBuf>,
+    window_thumbnail_path: Option<PathBuf>,
     is_selected: bool,
     show_action_hints: bool,
 }
@@ -489,6 +577,7 @@ fn view_result_row(row_state: &ResultRowView) -> Element<'static, Message> {
     let show_action_hints = row_state.show_action_hints;
     let result = &row_state.result;
     let icon_path = row_state.icon_path.clone();
+    let window_thumbnail_path = row_state.window_thumbnail_path.clone();
     let row_id = row_widget_id(result);
     let title_color = if is_selected {
         color_from_hex(0xF7FAFF)
@@ -505,20 +594,7 @@ fn view_result_row(row_state: &ResultRowView) -> Element<'static, Message> {
         column![text(result.title.clone()).size(18).color(title_color)].spacing(6);
 
     if !result.subtitle.trim().is_empty() {
-        let subtitle_line = if result.kind == MatchKind::Window {
-            if let Some(icon_path) = icon_path.clone() {
-                row![
-                    icon_widget(icon_path, SUBTITLE_ICON_SIZE),
-                    text(result.subtitle.clone()).size(14).color(subtitle_color)
-                ]
-                .align_y(Alignment::Center)
-                .spacing(6)
-            } else {
-                row![text(result.subtitle.clone()).size(14).color(subtitle_color)]
-            }
-        } else {
-            row![text(result.subtitle.clone()).size(14).color(subtitle_color)]
-        };
+        let subtitle_line = row![text(result.subtitle.clone()).size(14).color(subtitle_color)];
 
         text_column = text_column.push(subtitle_line);
     }
@@ -535,7 +611,7 @@ fn view_result_row(row_state: &ResultRowView) -> Element<'static, Message> {
     }
 
     let row_content = row![
-        leading_visual(result, icon_path, is_selected),
+        leading_visual(result, icon_path, window_thumbnail_path, is_selected),
         text_column.width(Length::Fill)
     ]
     .align_y(Alignment::Center)
@@ -635,6 +711,7 @@ struct CachedRowBounds {
 #[derive(Clone, Debug)]
 struct MeasuredSelectedResultVisibility {
     row_bounds: HashMap<Id, CachedRowBounds>,
+    visible_row_ids: HashSet<Id>,
     target_offset_y: Option<f32>,
 }
 
@@ -698,6 +775,7 @@ impl Operation<MeasuredSelectedResultVisibility> for MeasureSelectedResultVisibi
         let Some(scrollable) = self.scrollable else {
             return Outcome::Some(MeasuredSelectedResultVisibility {
                 row_bounds: HashMap::new(),
+                visible_row_ids: HashSet::new(),
                 target_offset_y: None,
             });
         };
@@ -725,9 +803,15 @@ impl Operation<MeasuredSelectedResultVisibility> for MeasureSelectedResultVisibi
                 row_bounds.height,
             )
         });
+        let visible_row_ids = visible_row_ids_for_viewport(
+            scrollable.bounds.height,
+            scrollable.offset.y,
+            &row_bounds,
+        );
 
         Outcome::Some(MeasuredSelectedResultVisibility {
             row_bounds,
+            visible_row_ids,
             target_offset_y,
         })
     }
@@ -774,6 +858,27 @@ fn cached_scroll_offset_for_row(viewport: Viewport, row_bounds: CachedRowBounds)
     )
 }
 
+fn visible_row_ids_for_viewport(
+    viewport_height: f32,
+    current_offset: f32,
+    row_bounds: &HashMap<Id, CachedRowBounds>,
+) -> HashSet<Id> {
+    if viewport_height <= 0.0 {
+        return HashSet::new();
+    }
+
+    let visible_top = (current_offset - WINDOW_THUMBNAIL_OVERSCAN).max(0.0);
+    let visible_bottom = current_offset + viewport_height + WINDOW_THUMBNAIL_OVERSCAN;
+
+    row_bounds
+        .iter()
+        .filter_map(|(id, bounds)| {
+            let row_bottom = bounds.top + bounds.height;
+            (row_bottom >= visible_top && bounds.top <= visible_bottom).then(|| id.clone())
+        })
+        .collect()
+}
+
 impl PickerApp {
     fn request_icon_index(&mut self) -> Task<Message> {
         if self.icon_index.is_some() || self.is_loading_icon_index {
@@ -799,6 +904,47 @@ impl PickerApp {
         Task::perform(
             async move { search_registry(registry, &query) },
             move |result| Message::SearchFinished { request_id, result },
+        )
+    }
+
+    fn request_visible_window_thumbnails(&mut self) -> Task<Message> {
+        let mut window_ids = Vec::new();
+
+        for result in &self.results {
+            if !self.visible_result_row_ids.contains(&row_widget_id(result)) {
+                continue;
+            }
+
+            let Some(window_id) = window_id_for_result(result) else {
+                continue;
+            };
+
+            if self.window_thumbnails.contains_key(&window_id) {
+                continue;
+            }
+
+            self.window_thumbnails
+                .insert(window_id, WindowThumbnailState::Loading);
+            window_ids.push(window_id);
+
+            if window_ids.len() >= MAX_WINDOW_THUMBNAIL_REQUESTS_PER_BATCH {
+                break;
+            }
+        }
+
+        Task::batch(window_ids.into_iter().map(|window_id| {
+            Task::perform(
+                async move { fetch_window_thumbnail(window_id) },
+                move |result| Message::WindowThumbnailFinished { window_id, result },
+            )
+        }))
+    }
+
+    fn visible_result_row_ids_for_viewport(&self, viewport: Viewport) -> HashSet<Id> {
+        visible_row_ids_for_viewport(
+            viewport.bounds().height,
+            viewport.absolute_offset().y,
+            &self.results_row_bounds,
         )
     }
 
@@ -993,11 +1139,109 @@ fn activate_result(
     .map_err(|error| error.to_string())
 }
 
+fn window_id_for_result(result: &SearchResult) -> Option<u64> {
+    if result.kind != MatchKind::Window {
+        return None;
+    }
+
+    result
+        .item_id
+        .split_once(':')
+        .map_or(result.item_id.as_str(), |(window_id, _pid)| window_id)
+        .parse()
+        .ok()
+}
+
+fn window_thumbnail_path_for_result(
+    result: &SearchResult,
+    thumbnails: &HashMap<u64, WindowThumbnailState>,
+) -> Option<PathBuf> {
+    let window_id = window_id_for_result(result)?;
+
+    match thumbnails.get(&window_id)? {
+        WindowThumbnailState::Ready(path) => Some(path.clone()),
+        WindowThumbnailState::Loading | WindowThumbnailState::Failed => None,
+    }
+}
+
+fn fetch_window_thumbnail(window_id: u64) -> Result<LoadedWindowThumbnail, String> {
+    let thumbnail = request_niri_window_thumbnail(window_id)?;
+
+    if thumbnail.id != window_id {
+        return Err(format!(
+            "niri returned thumbnail for window {}, expected {window_id}",
+            thumbnail.id
+        ));
+    }
+
+    let png = BASE64_STANDARD
+        .decode(thumbnail.png_base64.as_bytes())
+        .map_err(|error| format!("failed to decode thumbnail PNG: {error}"))?;
+    let path = write_window_thumbnail(window_id, &png)?;
+
+    Ok(LoadedWindowThumbnail { window_id, path })
+}
+
+fn request_niri_window_thumbnail(window_id: u64) -> Result<NiriWindowThumbnail, String> {
+    let socket_path =
+        env::var_os("NIRI_SOCKET").ok_or_else(|| "NIRI_SOCKET is not set".to_string())?;
+    let mut socket = UnixStream::connect(socket_path)
+        .map_err(|error| format!("failed to connect to niri: {error}"))?;
+    socket
+        .set_read_timeout(Some(NIRI_THUMBNAIL_REQUEST_TIMEOUT))
+        .map_err(|error| format!("failed to configure niri socket read timeout: {error}"))?;
+    socket
+        .set_write_timeout(Some(NIRI_THUMBNAIL_REQUEST_TIMEOUT))
+        .map_err(|error| format!("failed to configure niri socket write timeout: {error}"))?;
+    let request = json!({
+        "WindowThumbnail": {
+            "id": window_id,
+            "max_width": WINDOW_THUMBNAIL_MAX_WIDTH,
+            "max_height": WINDOW_THUMBNAIL_MAX_HEIGHT,
+        }
+    });
+
+    serde_json::to_writer(&mut socket, &request)
+        .map_err(|error| format!("failed to encode niri thumbnail request: {error}"))?;
+    socket
+        .write_all(b"\n")
+        .map_err(|error| format!("failed to send niri thumbnail request: {error}"))?;
+
+    let mut reply_line = String::new();
+    BufReader::new(socket)
+        .read_line(&mut reply_line)
+        .map_err(|error| format!("failed to read niri thumbnail reply: {error}"))?;
+
+    let reply = serde_json::from_str::<NiriIpcReply>(&reply_line)
+        .map_err(|error| format!("failed to parse niri thumbnail reply: {error}"))?;
+
+    match reply {
+        NiriIpcReply::Ok(NiriIpcResponse::WindowThumbnail(thumbnail)) => Ok(thumbnail),
+        NiriIpcReply::Err(error) => Err(error),
+    }
+}
+
+fn write_window_thumbnail(window_id: u64, png: &[u8]) -> Result<PathBuf, String> {
+    let dir = env::temp_dir().join(format!("picky-window-thumbnails-{}", process::id()));
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("failed to create thumbnail cache directory: {error}"))?;
+
+    let path = dir.join(format!("window-{window_id}.png"));
+    fs::write(&path, png).map_err(|error| format!("failed to write thumbnail PNG: {error}"))?;
+
+    Ok(path)
+}
+
 fn leading_visual(
     result: &SearchResult,
     icon_path: Option<PathBuf>,
+    window_thumbnail_path: Option<PathBuf>,
     _is_selected: bool,
 ) -> Element<'static, Message> {
+    if result.kind == MatchKind::Window {
+        return window_thumbnail_visual(result, icon_path, window_thumbnail_path);
+    }
+
     if result.kind == MatchKind::Application {
         if let Some(icon_path) = icon_path {
             return icon_widget(icon_path, RESULT_ICON_SIZE);
@@ -1018,6 +1262,30 @@ fn leading_visual(
     text(kind_symbol(result))
         .size(24)
         .width(Length::Fixed(RESULT_ICON_SIZE))
+        .into()
+}
+
+fn window_thumbnail_visual(
+    result: &SearchResult,
+    icon_path: Option<PathBuf>,
+    thumbnail_path: Option<PathBuf>,
+) -> Element<'static, Message> {
+    let content = if let Some(thumbnail_path) = thumbnail_path {
+        image(image::Handle::from_path(thumbnail_path))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    } else if let Some(icon_path) = icon_path {
+        icon_widget(icon_path, RESULT_ICON_SIZE)
+    } else {
+        text(kind_symbol(result)).size(24).into()
+    };
+
+    container(content)
+        .center_x(Length::Fixed(WINDOW_THUMBNAIL_WIDTH))
+        .center_y(Length::Fixed(WINDOW_THUMBNAIL_HEIGHT))
+        .clip(true)
+        .style(window_thumbnail_style)
         .into()
 }
 
@@ -1380,6 +1648,13 @@ fn panel_card_style(_theme: &Theme) -> container::Style {
         .color(theme_text())
 }
 
+fn window_thumbnail_style(_theme: &Theme) -> container::Style {
+    container::Style::default()
+        .background(color_from_hex(0x151A2D))
+        .border(border::rounded(8).width(1).color(theme_border()))
+        .color(theme_text())
+}
+
 fn results_surface_style(_theme: &Theme) -> container::Style {
     container::Style::default()
         .background(color_from_hex(0x1F2437))
@@ -1539,6 +1814,8 @@ mod tests {
             results_scroll_id: Id::new("results-scroll"),
             results_viewport: None,
             results_row_bounds: HashMap::new(),
+            visible_result_row_ids: HashSet::new(),
+            window_thumbnails: HashMap::new(),
             selected_result_visibility_request_id: 0,
             is_starting_up: false,
             is_loading_icon_index: false,
@@ -1554,6 +1831,19 @@ mod tests {
             icon_name: None,
             kind: MatchKind::Application,
             actions,
+            score: 1,
+        }
+    }
+
+    fn window_result(item_id: &str) -> SearchResult {
+        SearchResult {
+            module_key: "niri-windows",
+            item_id: item_id.to_string(),
+            title: format!("Window {item_id}"),
+            subtitle: String::new(),
+            icon_name: None,
+            kind: MatchKind::Window,
+            actions: Vec::new(),
             score: 1,
         }
     }
@@ -1755,6 +2045,90 @@ mod tests {
         let offset = scroll_offset_to_reveal_row(100.0, 300.0, 20.0, 40.0, 20.0);
 
         assert_eq!(offset, None);
+    }
+
+    #[test]
+    fn window_id_for_result_reads_niri_window_item_ids() {
+        assert_eq!(window_id_for_result(&window_result("42")), Some(42));
+        assert_eq!(window_id_for_result(&window_result("42:1234")), Some(42));
+        assert_eq!(
+            window_id_for_result(&window_result("not-a-window-id")),
+            None
+        );
+        assert_eq!(window_id_for_result(&result("42:1234", Vec::new())), None);
+    }
+
+    #[test]
+    fn visible_row_ids_include_viewport_and_thumbnail_overscan() {
+        let above = Id::new("above");
+        let in_overscan_above = Id::new("in-overscan-above");
+        let in_viewport = Id::new("in-viewport");
+        let in_overscan_below = Id::new("in-overscan-below");
+        let below = Id::new("below");
+        let mut row_bounds = HashMap::new();
+        row_bounds.insert(
+            above.clone(),
+            CachedRowBounds {
+                top: 0.0,
+                height: 30.0,
+            },
+        );
+        row_bounds.insert(
+            in_overscan_above.clone(),
+            CachedRowBounds {
+                top: 35.0,
+                height: 10.0,
+            },
+        );
+        row_bounds.insert(
+            in_viewport.clone(),
+            CachedRowBounds {
+                top: 220.0,
+                height: 40.0,
+            },
+        );
+        row_bounds.insert(
+            in_overscan_below.clone(),
+            CachedRowBounds {
+                top: 450.0,
+                height: 10.0,
+            },
+        );
+        row_bounds.insert(
+            below.clone(),
+            CachedRowBounds {
+                top: 461.0,
+                height: 20.0,
+            },
+        );
+
+        let visible = visible_row_ids_for_viewport(100.0, 200.0, &row_bounds);
+
+        assert!(!visible.contains(&above));
+        assert!(visible.contains(&in_overscan_above));
+        assert!(visible.contains(&in_viewport));
+        assert!(visible.contains(&in_overscan_below));
+        assert!(!visible.contains(&below));
+    }
+
+    #[test]
+    fn visible_window_thumbnail_requests_are_marked_loading_in_batches() {
+        let results = (1..=8)
+            .map(|window_id| window_result(&window_id.to_string()))
+            .collect::<Vec<_>>();
+        let mut app = app_with_results(results);
+        app.visible_result_row_ids = app.results.iter().map(row_widget_id).collect();
+
+        let _ = app.request_visible_window_thumbnails();
+
+        let loading_count = app
+            .window_thumbnails
+            .values()
+            .filter(|state| **state == WindowThumbnailState::Loading)
+            .count();
+        assert_eq!(loading_count, MAX_WINDOW_THUMBNAIL_REQUESTS_PER_BATCH);
+        assert_eq!(app.window_thumbnails.len(), 6);
+        assert!(!app.window_thumbnails.contains_key(&7));
     }
 
     #[test]

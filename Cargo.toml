@@ -6,6 +6,7 @@ default-run = "picky"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 iced = { version = "0.14.0", features = ["advanced", "image", "lazy", "svg", "sysinfo"] }
 lz4_flex = "0.11"
 serde = { version = "1.0", features = ["derive"] }
