@@ -12,7 +12,7 @@ Read `iced-best-practices/iced-best-practices.md` and follow the guidelines ther
 
 - `nix develop`: enter the pinned dev shell with Rust, GTK, Vulkan, and Wayland tooling.
 - `cargo run`: run `picky` locally.
-- `WGPU_BACKEND=gl ICED_BACKEND=wgpu cargo run`: preferred graphics path when checking Iced rendering issues.
+- `ICED_BACKEND=wgpu cargo run`: preferred graphics path when checking Iced rendering issues; fail rather than silently using Iced's software fallback.
 - `cargo check`: fast compile verification.
 - `cargo test`: run unit tests.
 - `cargo run --bin wgpu_probe`: inspect `wgpu` adapter/backend detection.

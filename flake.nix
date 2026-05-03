@@ -2,7 +2,7 @@
   description = "picky: a modular selection/search picker for Niri";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay.url = "github:oxalica/rust-overlay";
   };
@@ -24,10 +24,10 @@
         runtimeLibs = with pkgs; [
           wayland
           libxkbcommon
-          xorg.libX11
-          xorg.libXcursor
-          xorg.libXi
-          xorg.libXrandr
+          libx11
+          libxcursor
+          libxi
+          libxrandr
           libGL
           vulkan-loader
         ];
@@ -122,7 +122,7 @@
             firefox
             grim
             mesa-demos
-            nixfmt-rfc-style
+            nixfmt
             rustToolchain
             rust-analyzer
             pkg-config
@@ -144,6 +144,7 @@
 
           NIX_SHELL_PRESERVE_PROMPT = "1";
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
+          ICED_BACKEND = "wgpu";
 
           shellHook = ''
             ${graphicsRuntimeHook}
@@ -151,7 +152,7 @@
           '';
         };
 
-        formatter = pkgs.nixfmt-rfc-style;
+        formatter = pkgs.nixfmt;
       }
     );
 }
