@@ -6,7 +6,6 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -135,14 +134,43 @@ impl std::fmt::Debug for StartupContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WindowThumbnailState {
     Loading,
-    Ready(PathBuf),
+    Ready(CachedWindowThumbnail),
     Failed,
+}
+
+#[derive(Clone)]
+struct CachedWindowThumbnail {
+    window_id: u64,
+    handle: image::Handle,
+}
+
+impl std::fmt::Debug for CachedWindowThumbnail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CachedWindowThumbnail")
+            .field("window_id", &self.window_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for CachedWindowThumbnail {
+    fn eq(&self, other: &Self) -> bool {
+        self.window_id == other.window_id
+    }
+}
+
+impl Eq for CachedWindowThumbnail {}
+
+impl Hash for CachedWindowThumbnail {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.window_id.hash(state);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LoadedWindowThumbnail {
     window_id: u64,
-    path: PathBuf,
+    thumbnail: CachedWindowThumbnail,
 }
 
 #[derive(Debug, Deserialize)]
@@ -412,7 +440,7 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
             match result {
                 Ok(thumbnail) if thumbnail.window_id == window_id => {
                     app.window_thumbnails
-                        .insert(window_id, WindowThumbnailState::Ready(thumbnail.path));
+                        .insert(window_id, WindowThumbnailState::Ready(thumbnail.thumbnail));
                 }
                 Ok(thumbnail) => {
                     eprintln!(
@@ -488,10 +516,7 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
                         result.icon_name.as_deref(),
                         app.icon_index.as_deref(),
                     ),
-                    window_thumbnail_path: window_thumbnail_path_for_result(
-                        result,
-                        &app.window_thumbnails,
-                    ),
+                    window_thumbnail: window_thumbnail_for_result(result, &app.window_thumbnails),
                     is_selected: app.selected_index == Some(index),
                     show_action_hints: app.selected_index == Some(index)
                         && app.focus_target == FocusTarget::Results,
@@ -560,7 +585,7 @@ struct ResultRowView {
     index: usize,
     result: SearchResult,
     icon_path: Option<PathBuf>,
-    window_thumbnail_path: Option<PathBuf>,
+    window_thumbnail: Option<CachedWindowThumbnail>,
     is_selected: bool,
     show_action_hints: bool,
 }
@@ -577,7 +602,7 @@ fn view_result_row(row_state: &ResultRowView) -> Element<'static, Message> {
     let show_action_hints = row_state.show_action_hints;
     let result = &row_state.result;
     let icon_path = row_state.icon_path.clone();
-    let window_thumbnail_path = row_state.window_thumbnail_path.clone();
+    let window_thumbnail = row_state.window_thumbnail.clone();
     let row_id = row_widget_id(result);
     let title_color = if is_selected {
         color_from_hex(0xF7FAFF)
@@ -611,7 +636,7 @@ fn view_result_row(row_state: &ResultRowView) -> Element<'static, Message> {
     }
 
     let row_content = row![
-        leading_visual(result, icon_path, window_thumbnail_path, is_selected),
+        leading_visual(result, icon_path, window_thumbnail, is_selected),
         text_column.width(Length::Fill)
     ]
     .align_y(Alignment::Center)
@@ -1152,14 +1177,14 @@ fn window_id_for_result(result: &SearchResult) -> Option<u64> {
         .ok()
 }
 
-fn window_thumbnail_path_for_result(
+fn window_thumbnail_for_result(
     result: &SearchResult,
     thumbnails: &HashMap<u64, WindowThumbnailState>,
-) -> Option<PathBuf> {
+) -> Option<CachedWindowThumbnail> {
     let window_id = window_id_for_result(result)?;
 
     match thumbnails.get(&window_id)? {
-        WindowThumbnailState::Ready(path) => Some(path.clone()),
+        WindowThumbnailState::Ready(thumbnail) => Some(thumbnail.clone()),
         WindowThumbnailState::Loading | WindowThumbnailState::Failed => None,
     }
 }
@@ -1177,9 +1202,12 @@ fn fetch_window_thumbnail(window_id: u64) -> Result<LoadedWindowThumbnail, Strin
     let png = BASE64_STANDARD
         .decode(thumbnail.png_base64.as_bytes())
         .map_err(|error| format!("failed to decode thumbnail PNG: {error}"))?;
-    let path = write_window_thumbnail(window_id, &png)?;
+    let handle = image::Handle::from_bytes(png);
 
-    Ok(LoadedWindowThumbnail { window_id, path })
+    Ok(LoadedWindowThumbnail {
+        window_id,
+        thumbnail: CachedWindowThumbnail { window_id, handle },
+    })
 }
 
 fn request_niri_window_thumbnail(window_id: u64) -> Result<NiriWindowThumbnail, String> {
@@ -1221,25 +1249,14 @@ fn request_niri_window_thumbnail(window_id: u64) -> Result<NiriWindowThumbnail, 
     }
 }
 
-fn write_window_thumbnail(window_id: u64, png: &[u8]) -> Result<PathBuf, String> {
-    let dir = env::temp_dir().join(format!("picky-window-thumbnails-{}", process::id()));
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("failed to create thumbnail cache directory: {error}"))?;
-
-    let path = dir.join(format!("window-{window_id}.png"));
-    fs::write(&path, png).map_err(|error| format!("failed to write thumbnail PNG: {error}"))?;
-
-    Ok(path)
-}
-
 fn leading_visual(
     result: &SearchResult,
     icon_path: Option<PathBuf>,
-    window_thumbnail_path: Option<PathBuf>,
+    window_thumbnail: Option<CachedWindowThumbnail>,
     _is_selected: bool,
 ) -> Element<'static, Message> {
     if result.kind == MatchKind::Window {
-        return window_thumbnail_visual(result, icon_path, window_thumbnail_path);
+        return window_thumbnail_visual(result, icon_path, window_thumbnail);
     }
 
     if result.kind == MatchKind::Application {
@@ -1268,10 +1285,10 @@ fn leading_visual(
 fn window_thumbnail_visual(
     result: &SearchResult,
     icon_path: Option<PathBuf>,
-    thumbnail_path: Option<PathBuf>,
+    thumbnail: Option<CachedWindowThumbnail>,
 ) -> Element<'static, Message> {
-    let content = if let Some(thumbnail_path) = thumbnail_path {
-        image(image::Handle::from_path(thumbnail_path))
+    let content = if let Some(thumbnail) = thumbnail {
+        image(thumbnail.handle)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
