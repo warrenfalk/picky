@@ -310,6 +310,25 @@ fn parse_window_target(item_id: &str) -> Result<WindowTarget<'_>> {
     }
 }
 
+pub fn focus_picker_window(pid: u32) -> Result<bool> {
+    focus_picker_window_with_backend(&ProcessWindowsBackend, pid)
+}
+
+fn focus_picker_window_with_backend(backend: &dyn WindowsBackend, pid: u32) -> Result<bool> {
+    let Some(window) = backend
+        .load_windows()?
+        .into_iter()
+        .find(|window| window.app_id == "picky" && window.pid == Some(pid))
+    else {
+        return Ok(false);
+    };
+
+    // Winit's focus_window is unsupported on Wayland. Ask Niri to activate the
+    // exact window belonging to the process that holds the instance lock.
+    backend.focus_window(&window.id.to_string())?;
+    Ok(true)
+}
+
 fn focus_window(window_id: &str) -> Result<()> {
     let status = Command::new("niri")
         .args(["msg", "action", "focus-window", "--id", window_id])
@@ -536,6 +555,38 @@ mod tests {
             name: name.to_string(),
             icon_name: None,
         }
+    }
+
+    #[test]
+    fn focuses_only_the_picker_window_owned_by_the_running_instance() {
+        let state = Arc::new(Mutex::new(FakeState {
+            windows: vec![
+                window(1, "Picky", "picky", Some(111), 10),
+                window(2, "Other", "other", Some(222), 10),
+                window(3, "Picky", "picky", Some(222), 10),
+            ],
+            ..FakeState::default()
+        }));
+        let backend = FakeWindowsBackend {
+            state: state.clone(),
+        };
+
+        assert!(focus_picker_window_with_backend(&backend, 222).unwrap());
+        assert_eq!(state.lock().unwrap().focused, vec!["3"]);
+    }
+
+    #[test]
+    fn waits_when_the_running_picker_has_no_window_yet() {
+        let state = Arc::new(Mutex::new(FakeState {
+            windows: vec![window(1, "Picky", "picky", Some(111), 10)],
+            ..FakeState::default()
+        }));
+        let backend = FakeWindowsBackend {
+            state: state.clone(),
+        };
+
+        assert!(!focus_picker_window_with_backend(&backend, 222).unwrap());
+        assert!(state.lock().unwrap().focused.is_empty());
     }
 
     #[test]

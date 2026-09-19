@@ -70,6 +70,7 @@ enum AppKey {
 
 #[derive(Clone, Debug)]
 enum Message {
+    WindowFocusChanged(bool),
     QueryChanged(String),
     ActivateSelected,
     ActivateSelectedAction(&'static str),
@@ -96,6 +97,7 @@ enum Message {
 }
 
 pub struct PickerApp {
+    window_is_focused: bool,
     registry: Option<Arc<Mutex<ModuleRegistry>>>,
     icon_index: Option<Arc<IconIndex>>,
     query: String,
@@ -236,6 +238,7 @@ fn initialize() -> (PickerApp, Task<Message>) {
     let search_input_id = Id::unique();
     let results_scroll_id = Id::new("results-scroll");
     let app = PickerApp {
+        window_is_focused: false,
         registry: None,
         icon_index: None,
         query: String::new(),
@@ -267,9 +270,23 @@ fn initialize() -> (PickerApp, Task<Message>) {
 }
 
 fn subscription(app: &PickerApp) -> Subscription<Message> {
-    match app.focus_target {
+    let keyboard = match app.focus_target {
         FocusTarget::Search => event::listen_with(search_event_message),
         FocusTarget::Results => event::listen_with(results_event_message),
+    };
+
+    Subscription::batch([keyboard, event::listen_with(window_event_message)])
+}
+
+fn window_event_message(
+    event: iced::Event,
+    _status: event::Status,
+    _window: window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocusChanged(true)),
+        iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowFocusChanged(false)),
+        _ => None,
     }
 }
 
@@ -324,6 +341,16 @@ fn results_key_message(key: Key, _modifiers: keyboard::Modifiers) -> Option<Mess
 
 fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
     match message {
+        Message::WindowFocusChanged(focused) => {
+            let lost_focus = app.window_is_focused && !focused;
+            app.window_is_focused = focused;
+
+            if lost_focus {
+                iced::exit()
+            } else {
+                Task::none()
+            }
+        }
         Message::QueryChanged(query) => {
             app.query = query;
             app.focus_target = FocusTarget::Search;
@@ -1817,6 +1844,7 @@ mod tests {
 
     fn app_with_results(results: Vec<SearchResult>) -> PickerApp {
         PickerApp {
+            window_is_focused: false,
             registry: Some(Arc::new(Mutex::new(ModuleRegistry::new(Vec::new())))),
             icon_index: None,
             query: String::new(),
@@ -1879,6 +1907,40 @@ mod tests {
     fn create_icon_file(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, []).unwrap();
+    }
+
+    #[test]
+    fn losing_window_focus_requests_exit() {
+        let mut app = app_with_results(Vec::new());
+        let window = window::Id::unique();
+
+        let focused = window_event_message(
+            iced::Event::Window(window::Event::Focused),
+            event::Status::Ignored,
+            window,
+        )
+        .unwrap();
+        assert_eq!(update(&mut app, focused).units(), 0);
+        assert!(app.window_is_focused);
+
+        let unfocused = window_event_message(
+            iced::Event::Window(window::Event::Unfocused),
+            event::Status::Ignored,
+            window,
+        )
+        .unwrap();
+        assert_eq!(update(&mut app, unfocused).units(), 1);
+        assert!(!app.window_is_focused);
+    }
+
+    #[test]
+    fn an_initial_unfocused_event_does_not_close_the_starting_window() {
+        let mut app = app_with_results(Vec::new());
+
+        assert_eq!(
+            update(&mut app, Message::WindowFocusChanged(false)).units(),
+            0
+        );
     }
 
     #[test]
