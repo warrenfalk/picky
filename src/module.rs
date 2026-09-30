@@ -11,6 +11,7 @@ pub enum ActivationOutcome {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum MatchKind {
     Application,
+    CodexSession,
     Notification,
     Window,
     Workspace,
@@ -59,13 +60,7 @@ impl ModuleRegistry {
             results.append(&mut module_results);
         }
 
-        results.sort_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| left.kind.cmp(&right.kind))
-                .then_with(|| left.title.cmp(&right.title))
-        });
+        sort_results(&mut results);
 
         Ok(results)
     }
@@ -87,6 +82,23 @@ impl ModuleRegistry {
 
         module.activate(&result.item_id, action_id)
     }
+}
+
+pub fn sort_results(results: &mut [SearchResult]) {
+    results.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| {
+                if left.kind == MatchKind::CodexSession {
+                    // Preserve the session module's recency order when match scores tie.
+                    std::cmp::Ordering::Equal
+                } else {
+                    left.title.cmp(&right.title)
+                }
+            })
+    });
 }
 
 #[cfg(test)]

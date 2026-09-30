@@ -13,6 +13,7 @@ use crate::module::{
     ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, ModuleRegistry, ResultAction, SearchResult,
 };
 use crate::modules;
+use crate::modules::codex_sessions::{self, FeedUpdate, SessionIndicator, SessionStore};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use iced::advanced::widget::{Operation, operate, operation::Outcome};
@@ -85,6 +86,7 @@ enum Message {
     SystemInfoLoaded(system::Information),
     StartupFinished(StartupContext),
     IconIndexFinished(Arc<IconIndex>),
+    CodexSessionsChanged(FeedUpdate),
     SearchFinished {
         request_id: u64,
         result: Result<Vec<SearchResult>, String>,
@@ -99,6 +101,8 @@ enum Message {
 pub struct PickerApp {
     window_is_focused: bool,
     registry: Option<Arc<Mutex<ModuleRegistry>>>,
+    codex_sessions: SessionStore,
+    codex_error: String,
     icon_index: Option<Arc<IconIndex>>,
     query: String,
     error_message: String,
@@ -237,9 +241,13 @@ fn application_style(_app: &PickerApp, _theme: &Theme) -> theme::Style {
 fn initialize() -> (PickerApp, Task<Message>) {
     let search_input_id = Id::unique();
     let results_scroll_id = Id::new("results-scroll");
+    let codex_sessions = SessionStore::default();
+    let startup_sessions = codex_sessions.clone();
     let app = PickerApp {
         window_is_focused: false,
         registry: None,
+        codex_sessions,
+        codex_error: String::new(),
         icon_index: None,
         query: String::new(),
         error_message: String::new(),
@@ -263,7 +271,10 @@ fn initialize() -> (PickerApp, Task<Message>) {
     let task = Task::batch([
         focus(app.search_input_id.clone()),
         system::information().map(Message::SystemInfoLoaded),
-        Task::perform(async { load_startup_context() }, Message::StartupFinished),
+        Task::perform(
+            async move { load_startup_context(startup_sessions) },
+            Message::StartupFinished,
+        ),
     ]);
 
     (app, task)
@@ -275,7 +286,11 @@ fn subscription(app: &PickerApp) -> Subscription<Message> {
         FocusTarget::Results => event::listen_with(results_event_message),
     };
 
-    Subscription::batch([keyboard, event::listen_with(window_event_message)])
+    Subscription::batch([
+        keyboard,
+        event::listen_with(window_event_message),
+        codex_sessions::subscription().map(Message::CodexSessionsChanged),
+    ])
 }
 
 fn window_event_message(
@@ -413,6 +428,20 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
             app.icon_index = Some(icon_index);
             Task::none()
         }
+        Message::CodexSessionsChanged(update) => {
+            let sessions = match update {
+                Ok(sessions) => {
+                    app.codex_error.clear();
+                    sessions
+                }
+                Err(error) => {
+                    app.codex_error = error;
+                    Vec::new()
+                }
+            };
+            app.codex_sessions.replace(sessions);
+            app.refresh_codex_results()
+        }
         Message::KeyPressed(key) => match app.focus_target {
             FocusTarget::Search => app.handle_search_key(key),
             FocusTarget::Results => app.handle_results_key(key),
@@ -423,7 +452,9 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
             }
 
             match result {
-                Ok(results) => {
+                Ok(mut results) => {
+                    // A live update may have arrived after this search began.
+                    app.codex_sessions.merge_results(&app.query, &mut results);
                     app.error_message.clear();
                     app.results = results;
                     app.results_row_bounds.clear();
@@ -539,6 +570,11 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
                 let row = ResultRowView {
                     index,
                     result: result.clone(),
+                    codex_indicator: if result.kind == MatchKind::CodexSession {
+                        app.codex_sessions.indicator(&result.item_id)
+                    } else {
+                        None
+                    },
                     icon_path: resolve_icon_path(
                         result.icon_name.as_deref(),
                         app.icon_index.as_deref(),
@@ -593,6 +629,14 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
         ));
     }
 
+    if !app.codex_error.is_empty() {
+        content = content.push(view_status_banner(
+            "Codex",
+            app.codex_error.clone(),
+            BannerTone::Warning,
+        ));
+    }
+
     container(
         container(content)
             .padding(20)
@@ -611,6 +655,7 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
 struct ResultRowView {
     index: usize,
     result: SearchResult,
+    codex_indicator: Option<SessionIndicator>,
     icon_path: Option<PathBuf>,
     window_thumbnail: Option<CachedWindowThumbnail>,
     is_selected: bool,
@@ -663,7 +708,12 @@ fn view_result_row(row_state: &ResultRowView) -> Element<'static, Message> {
     }
 
     let row_content = row![
-        leading_visual(result, icon_path, window_thumbnail, is_selected),
+        leading_visual(
+            result,
+            icon_path,
+            window_thumbnail,
+            row_state.codex_indicator
+        ),
         text_column.width(Length::Fill)
     ]
     .align_y(Alignment::Center)
@@ -932,6 +982,41 @@ fn visible_row_ids_for_viewport(
 }
 
 impl PickerApp {
+    fn refresh_codex_results(&mut self) -> Task<Message> {
+        let mut results = self.results.clone();
+        self.codex_sessions.merge_results(&self.query, &mut results);
+        if results == self.results {
+            return Task::none();
+        }
+
+        self.selected_index = if self.focus_target == FocusTarget::Search {
+            (!results.is_empty()).then_some(0)
+        } else {
+            self.selected_result()
+                .and_then(|selected| {
+                    results.iter().position(|result| {
+                        result.module_key == selected.module_key
+                            && result.item_id == selected.item_id
+                    })
+                })
+                .or_else(|| {
+                    (!results.is_empty())
+                        .then(|| self.selected_index.unwrap_or(0).min(results.len() - 1))
+                })
+        };
+        self.results = results;
+        self.results_row_bounds.clear();
+        self.visible_result_row_ids.clear();
+
+        if self.results.is_empty() {
+            self.invalidate_selected_result_scroll();
+            self.focus_target = FocusTarget::Search;
+            focus(self.search_input_id.clone())
+        } else {
+            self.schedule_selected_result_scroll()
+        }
+    }
+
     fn request_icon_index(&mut self) -> Task<Message> {
         if self.icon_index.is_some() || self.is_loading_icon_index {
             return Task::none();
@@ -1280,8 +1365,12 @@ fn leading_visual(
     result: &SearchResult,
     icon_path: Option<PathBuf>,
     window_thumbnail: Option<CachedWindowThumbnail>,
-    _is_selected: bool,
+    codex_indicator: Option<SessionIndicator>,
 ) -> Element<'static, Message> {
+    if let Some(indicator) = codex_indicator {
+        return codex_status_icon(indicator);
+    }
+
     if result.kind == MatchKind::Window {
         return window_thumbnail_visual(result, icon_path, window_thumbnail);
     }
@@ -1306,6 +1395,43 @@ fn leading_visual(
     text(kind_symbol(result))
         .size(24)
         .width(Length::Fixed(RESULT_ICON_SIZE))
+        .into()
+}
+
+fn codex_status_icon(indicator: SessionIndicator) -> Element<'static, Message> {
+    let (color, path) = match indicator {
+        SessionIndicator::Working => (0x83DFA0, "M8 5L20 12L8 19Z"),
+        SessionIndicator::Idle => (0x9CA7BF, "M7 6H10V18H7Z M14 6H17V18H14Z"),
+        SessionIndicator::Error => (
+            0xF08B9A,
+            "M6 4L12 10L18 4L20 6L14 12L20 18L18 20L12 14L6 20L4 18L10 12L4 6Z",
+        ),
+        SessionIndicator::Approval => (0xF0C56A, "M10.5 5H13.5V14H10.5Z M10.5 17H13.5V20H10.5Z"),
+        SessionIndicator::Input => (0x91BFFF, "M3 4H21V17H9L3 21Z M5 6V17L8.4 15H19V6Z"),
+        SessionIndicator::Attention => (0xC9A3F4, "M10.5 5H13.5V14H10.5Z M10.5 17H13.5V20H10.5Z"),
+    };
+    let color = color_from_hex(color);
+    let icon = svg(svg::Handle::from_memory(
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill-rule="evenodd" d="{path}"/></svg>"#,
+        )
+        .into_bytes(),
+    ))
+    .width(16)
+    .height(16)
+    .style(move |_theme, _status| svg::Style { color: Some(color) });
+
+    container(icon)
+        .center(RESULT_ICON_SIZE)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(color_from_hex(0x141A2B))),
+            border: border::Border {
+                color,
+                width: 1.0,
+                radius: CHIP_RADIUS.into(),
+            },
+            ..container::Style::default()
+        })
         .into()
 }
 
@@ -1573,6 +1699,7 @@ fn icon_format(path: &Path) -> Option<IconFormat> {
 fn kind_symbol(result: &SearchResult) -> &'static str {
     match result.kind {
         MatchKind::Application => "📦",
+        MatchKind::CodexSession => "✦",
         MatchKind::Notification => "🔔",
         MatchKind::Window => "🗖",
         MatchKind::Workspace => "🖥",
@@ -1830,9 +1957,11 @@ fn theme_error() -> Color {
     color_from_hex(0xE18497)
 }
 
-fn load_startup_context() -> StartupContext {
+fn load_startup_context(codex_sessions: SessionStore) -> StartupContext {
     StartupContext {
-        registry: Arc::new(Mutex::new(ModuleRegistry::new(modules::default_modules()))),
+        registry: Arc::new(Mutex::new(ModuleRegistry::new(modules::default_modules(
+            codex_sessions,
+        )))),
     }
 }
 
@@ -1846,6 +1975,8 @@ mod tests {
         PickerApp {
             window_is_focused: false,
             registry: Some(Arc::new(Mutex::new(ModuleRegistry::new(Vec::new())))),
+            codex_sessions: SessionStore::default(),
+            codex_error: String::new(),
             icon_index: None,
             query: String::new(),
             error_message: String::new(),
@@ -1878,6 +2009,144 @@ mod tests {
             actions,
             score: 1,
         }
+    }
+
+    fn codex_update(id: &str, title: &str) -> FeedUpdate {
+        Ok(vec![
+            serde_json::from_value(json!({
+                "id": id, "title": title, "cwd": "/work/picky", "working": true,
+                "attention": [], "loaded": true
+            }))
+            .unwrap(),
+        ])
+    }
+
+    #[test]
+    fn live_codex_updates_preserve_selection_when_rows_move_or_titles_change() {
+        let mut app = app_with_results(vec![result("Firefox", Vec::new())]);
+        app.focus_target = FocusTarget::Results;
+        let _ = update(
+            &mut app,
+            Message::CodexSessionsChanged(codex_update("session", "Old title")),
+        );
+        assert_eq!(app.results.len(), 2);
+        assert_eq!(app.selected_result().unwrap().title, "Firefox");
+        assert_eq!(app.selected_index, Some(1));
+
+        app.selected_index = Some(0);
+        let _ = update(
+            &mut app,
+            Message::CodexSessionsChanged(codex_update("session", "New title")),
+        );
+        assert_eq!(app.selected_result().unwrap().item_id, "session");
+        assert_eq!(app.selected_result().unwrap().title, "New title");
+        assert_eq!(app.focus_target, FocusTarget::Results);
+        assert_eq!(
+            app.search_request_id, 0,
+            "live updates must not requery other modules"
+        );
+    }
+
+    #[test]
+    fn codex_disconnect_clears_only_codex_rows_and_recovers() {
+        let mut app = app_with_results(vec![result("Firefox", Vec::new())]);
+        let _ = update(
+            &mut app,
+            Message::CodexSessionsChanged(codex_update("session", "Task")),
+        );
+        app.focus_target = FocusTarget::Results;
+        app.selected_index = Some(0);
+        let _ = update(
+            &mut app,
+            Message::CodexSessionsChanged(Err("Disconnected".to_string())),
+        );
+        assert_eq!(app.results.len(), 1);
+        assert_eq!(app.selected_result().unwrap().title, "Firefox");
+        assert_eq!(app.codex_error, "Disconnected");
+        assert!(app.error_message.is_empty());
+
+        let _ = update(
+            &mut app,
+            Message::CodexSessionsChanged(codex_update("session", "Task")),
+        );
+        assert_eq!(app.results.len(), 2);
+        assert!(app.codex_error.is_empty());
+        assert_eq!(app.selected_result().unwrap().title, "Firefox");
+    }
+
+    #[test]
+    fn removing_the_last_codex_session_returns_focus_to_search() {
+        let mut app = app_with_results(Vec::new());
+        let _ = update(
+            &mut app,
+            Message::CodexSessionsChanged(codex_update("session", "Task")),
+        );
+        app.focus_target = FocusTarget::Results;
+        let _ = update(&mut app, Message::CodexSessionsChanged(Ok(Vec::new())));
+        assert!(app.results.is_empty());
+        assert_eq!(app.selected_index, None);
+        assert_eq!(app.focus_target, FocusTarget::Search);
+    }
+
+    #[test]
+    fn live_codex_updates_respect_the_current_query() {
+        let mut app = app_with_results(Vec::new());
+        app.query = "unrelated".to_string();
+        let _ = update(
+            &mut app,
+            Message::CodexSessionsChanged(codex_update("session", "Task")),
+        );
+        assert!(app.results.is_empty());
+    }
+
+    #[test]
+    fn live_codex_results_select_the_first_match_while_typing() {
+        let mut app = app_with_results(vec![result("Firefox", Vec::new())]);
+        let _ = update(
+            &mut app,
+            Message::CodexSessionsChanged(codex_update("session", "Task")),
+        );
+        assert_eq!(app.selected_index, Some(0));
+        assert_eq!(app.selected_result().unwrap().item_id, "session");
+        assert_eq!(app.focus_target, FocusTarget::Search);
+    }
+
+    #[test]
+    fn search_completion_cannot_restore_an_older_codex_snapshot() {
+        let mut app = app_with_results(Vec::new());
+        app.active_search_request_id = 1;
+        let _ = update(
+            &mut app,
+            Message::CodexSessionsChanged(codex_update("session", "Old title")),
+        );
+        let stale = app.results.clone();
+        let _ = update(
+            &mut app,
+            Message::CodexSessionsChanged(codex_update("session", "New title")),
+        );
+        let _ = update(
+            &mut app,
+            Message::SearchFinished {
+                request_id: 1,
+                result: Ok(stale.clone()),
+            },
+        );
+        assert_eq!(app.results.len(), 1);
+        assert_eq!(app.results[0].title, "New title");
+
+        let _ = update(
+            &mut app,
+            Message::CodexSessionsChanged(Err("Disconnected".to_string())),
+        );
+        let _ = update(
+            &mut app,
+            Message::SearchFinished {
+                request_id: 1,
+                result: Ok(stale),
+            },
+        );
+        assert!(app.results.is_empty());
+        assert_eq!(app.codex_error, "Disconnected");
     }
 
     fn window_result(item_id: &str) -> SearchResult {

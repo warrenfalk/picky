@@ -2687,8 +2687,11 @@ name = "picky"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-io",
+ "async-process",
  "base64",
  "iced",
+ "libc",
  "lz4_flex",
  "serde",
  "serde_json",
