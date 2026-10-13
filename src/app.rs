@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::launcher::{self, ActivationServer};
 use crate::module::{
     ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, ModuleRegistry, ResultAction, SearchResult,
 };
 use crate::modules;
 use crate::modules::codex_sessions::{self, FeedUpdate, SessionIndicator, SessionStore};
+use crate::modules::niri_feed;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use iced::advanced::widget::{Operation, operate, operation::Outcome};
@@ -71,7 +73,21 @@ enum AppKey {
 
 #[derive(Clone, Debug)]
 enum Message {
-    WindowFocusChanged(bool),
+    WindowFocusChanged(window::Id, bool),
+    WindowOpened(window::Id, u64),
+    WindowDismissed(window::Id),
+    WindowClosed(window::Id),
+    ResidentRequest(launcher::Request),
+    NiriChanged(niri_feed::Update),
+    NiriTick,
+    NiriSearchFinished {
+        request_id: u64,
+        result: Result<Vec<SearchResult>, String>,
+    },
+    ActivationCompleted {
+        generation: u64,
+        result: Result<ActivationOutcome, String>,
+    },
     QueryChanged(String),
     ActivateSelected,
     ActivateSelectedAction(&'static str),
@@ -92,6 +108,7 @@ enum Message {
         result: Result<Vec<SearchResult>, String>,
     },
     WindowThumbnailFinished {
+        generation: u64,
         window_id: u64,
         result: Result<LoadedWindowThumbnail, String>,
     },
@@ -99,6 +116,13 @@ enum Message {
 }
 
 pub struct PickerApp {
+    window_id: Option<window::Id>,
+    generation: u64,
+    activation_server: Option<Arc<ActivationServer>>,
+    niri: niri_feed::Store,
+    niri_dirty: bool,
+    niri_search_id: u64,
+    niri_search_pending: bool,
     window_is_focused: bool,
     registry: Option<Arc<Mutex<ModuleRegistry>>>,
     codex_sessions: SessionStore,
@@ -196,25 +220,29 @@ struct NiriWindowThumbnail {
     png_base64: String,
 }
 
-pub fn run() -> iced::Result {
-    iced::application(initialize, update, view)
+pub fn run(server: Arc<ActivationServer>) -> iced::Result {
+    iced::daemon(move || initialize(server.clone()), update, daemon_view)
         .title("Picky")
         .subscription(subscription)
-        .theme(theme)
-        .style(application_style)
-        .window(window::Settings {
-            size: Size::new(WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT),
-            position: window::Position::Centered,
-            decorations: false,
-            resizable: false,
-            transparent: true,
-            platform_specific: window::settings::PlatformSpecific {
-                application_id: "picky".to_string(),
-                ..window::settings::PlatformSpecific::default()
-            },
-            ..window::Settings::default()
-        })
+        .theme(|app: &PickerApp, _window| theme(app))
+        .style(|app: &PickerApp, theme: &Theme| application_style(app, theme))
         .run()
+}
+
+fn window_settings() -> window::Settings {
+    window::Settings {
+        size: Size::new(WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT),
+        position: window::Position::Centered,
+        decorations: false,
+        resizable: false,
+        transparent: true,
+        exit_on_close_request: false,
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: "picky".to_string(),
+            ..window::settings::PlatformSpecific::default()
+        },
+        ..window::Settings::default()
+    }
 }
 
 fn theme(_app: &PickerApp) -> Theme {
@@ -238,12 +266,21 @@ fn application_style(_app: &PickerApp, _theme: &Theme) -> theme::Style {
     }
 }
 
-fn initialize() -> (PickerApp, Task<Message>) {
+fn initialize(server: Arc<ActivationServer>) -> (PickerApp, Task<Message>) {
     let search_input_id = Id::unique();
     let results_scroll_id = Id::new("results-scroll");
     let codex_sessions = SessionStore::default();
     let startup_sessions = codex_sessions.clone();
-    let app = PickerApp {
+    let niri = niri_feed::Store::default();
+    let startup_niri = niri.clone();
+    let mut app = PickerApp {
+        window_id: None,
+        generation: 0,
+        activation_server: Some(server),
+        niri,
+        niri_dirty: false,
+        niri_search_id: 0,
+        niri_search_pending: false,
         window_is_focused: false,
         registry: None,
         codex_sessions,
@@ -269,10 +306,9 @@ fn initialize() -> (PickerApp, Task<Message>) {
     };
 
     let task = Task::batch([
-        focus(app.search_input_id.clone()),
-        system::information().map(Message::SystemInfoLoaded),
+        app.show(),
         Task::perform(
-            async move { load_startup_context(startup_sessions) },
+            background(move || load_startup_context(startup_sessions, startup_niri)),
             Message::StartupFinished,
         ),
     ]);
@@ -286,21 +322,37 @@ fn subscription(app: &PickerApp) -> Subscription<Message> {
         FocusTarget::Results => event::listen_with(results_event_message),
     };
 
-    Subscription::batch([
+    let mut subscriptions = vec![
         keyboard,
         event::listen_with(window_event_message),
         codex_sessions::subscription().map(Message::CodexSessionsChanged),
-    ])
+        niri_feed::subscription().map(Message::NiriChanged),
+    ];
+    if let Some(server) = &app.activation_server {
+        subscriptions.push(launcher::subscription(server.clone()).map(Message::ResidentRequest));
+    }
+    if app.window_id.is_some() {
+        subscriptions.push(niri_feed::ticks().map(|()| Message::NiriTick));
+    }
+    Subscription::batch(subscriptions)
 }
 
 fn window_event_message(
     event: iced::Event,
     _status: event::Status,
-    _window: window::Id,
+    window: window::Id,
 ) -> Option<Message> {
     match event {
-        iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocusChanged(true)),
-        iced::Event::Window(window::Event::Unfocused) => Some(Message::WindowFocusChanged(false)),
+        iced::Event::Window(window::Event::Focused) => {
+            Some(Message::WindowFocusChanged(window, true))
+        }
+        iced::Event::Window(window::Event::Unfocused) => {
+            Some(Message::WindowFocusChanged(window, false))
+        }
+        iced::Event::Window(window::Event::CloseRequested) => {
+            Some(Message::WindowDismissed(window))
+        }
+        iced::Event::Window(window::Event::Closed) => Some(Message::WindowClosed(window)),
         _ => None,
     }
 }
@@ -356,12 +408,71 @@ fn results_key_message(key: Key, _modifiers: keyboard::Modifiers) -> Option<Mess
 
 fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
     match message {
-        Message::WindowFocusChanged(focused) => {
+        Message::ResidentRequest(request) => match request {
+            launcher::Request::Activate => app.show(),
+            launcher::Request::Quit => iced::exit(),
+            launcher::Request::Failed(error) => {
+                eprintln!("activation listener failed: {error}");
+                iced::exit()
+            }
+        },
+        Message::WindowOpened(id, generation) => {
+            if app.window_id != Some(id) || app.generation != generation {
+                return window::close(id);
+            }
+            Task::batch([
+                focus(app.search_input_id.clone()),
+                system::information().map(Message::SystemInfoLoaded),
+            ])
+        }
+        Message::WindowDismissed(id) | Message::WindowClosed(id) => {
+            if app.window_id == Some(id) {
+                app.dismiss()
+            } else {
+                Task::none()
+            }
+        }
+        Message::NiriChanged(update) => {
+            if let Err(error) = &update {
+                eprintln!("Niri feed: {error}");
+            }
+            app.niri_dirty |= app.niri.apply(update);
+            Task::none()
+        }
+        Message::NiriTick => app.refresh_niri(),
+        Message::NiriSearchFinished { request_id, result } => {
+            if request_id != app.niri_search_id {
+                return Task::none();
+            }
+            app.niri_search_pending = false;
+            if app.window_id.is_none() || app.niri_dirty {
+                return Task::none();
+            }
+            match result {
+                Ok(results) => {
+                    app.merge_live_results(&["niri-windows", "niri-workspaces"], results)
+                }
+                Err(error) => {
+                    app.error_message = error;
+                    Task::none()
+                }
+            }
+        }
+        Message::ActivationCompleted { generation, result } => {
+            if generation != app.generation || app.window_id.is_none() {
+                return Task::none();
+            }
+            update(app, Message::ActivationFinished(result))
+        }
+        Message::WindowFocusChanged(id, focused) => {
+            if app.window_id != Some(id) {
+                return Task::none();
+            }
             let lost_focus = app.window_is_focused && !focused;
             app.window_is_focused = focused;
 
             if lost_focus {
-                iced::exit()
+                app.dismiss()
             } else {
                 Task::none()
             }
@@ -440,7 +551,11 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
                 }
             };
             app.codex_sessions.replace(sessions);
-            app.refresh_codex_results()
+            if app.window_id.is_some() {
+                app.refresh_codex_results()
+            } else {
+                Task::none()
+            }
         }
         Message::KeyPressed(key) => match app.focus_target {
             FocusTarget::Search => app.handle_search_key(key),
@@ -450,6 +565,8 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
             if request_id != app.active_search_request_id {
                 return Task::none();
             }
+            // Reconcile a snapshot search with feed changes that arrived while it ran.
+            app.niri_dirty = true;
 
             match result {
                 Ok(mut results) => {
@@ -494,7 +611,14 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
                 }
             }
         }
-        Message::WindowThumbnailFinished { window_id, result } => {
+        Message::WindowThumbnailFinished {
+            generation,
+            window_id,
+            result,
+        } => {
+            if generation != app.generation || app.window_id.is_none() {
+                return Task::none();
+            }
             match result {
                 Ok(thumbnail) if thumbnail.window_id == window_id => {
                     app.window_thumbnails
@@ -518,7 +642,7 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
             app.request_visible_window_thumbnails()
         }
         Message::ActivationFinished(result) => match result {
-            Ok(ActivationOutcome::ClosePicker) => iced::exit(),
+            Ok(ActivationOutcome::ClosePicker) => app.dismiss(),
             Ok(ActivationOutcome::RefreshResults) => app.request_search(),
             Err(error_message) => {
                 app.error_message = error_message;
@@ -649,6 +773,10 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
     .height(Length::Fill)
     .style(app_background_style)
     .into()
+}
+
+fn daemon_view(app: &PickerApp, _window: window::Id) -> Element<'_, Message> {
+    view(app)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -982,9 +1110,96 @@ fn visible_row_ids_for_viewport(
 }
 
 impl PickerApp {
+    fn show(&mut self) -> Task<Message> {
+        if self.window_id.is_some() {
+            return Task::perform(
+                background(|| modules::niri_windows::focus_picker_window(std::process::id())),
+                |result| {
+                    if let Err(error) = result {
+                        eprintln!("could not focus picker: {error}");
+                    }
+                    Message::NiriTick
+                },
+            );
+        }
+        self.generation += 1;
+        self.window_is_focused = false;
+        self.query.clear();
+        self.error_message.clear();
+        self.results.clear();
+        self.selected_index = None;
+        self.focus_target = FocusTarget::Search;
+        self.results_viewport = None;
+        self.results_row_bounds.clear();
+        self.visible_result_row_ids.clear();
+        self.window_thumbnails.clear();
+        self.invalidate_selected_result_scroll();
+        let generation = self.generation;
+        let (id, open) = window::open(window_settings());
+        self.window_id = Some(id);
+        Task::batch([
+            open.map(move |id| Message::WindowOpened(id, generation)),
+            self.request_search(),
+        ])
+    }
+
+    fn dismiss(&mut self) -> Task<Message> {
+        self.window_is_focused = false;
+        self.generation += 1;
+        self.search_request_id += 1;
+        self.active_search_request_id = self.search_request_id;
+        self.niri_search_id += 1;
+        self.niri_search_pending = false;
+        self.invalidate_selected_result_scroll();
+        self.results_row_bounds.clear();
+        self.visible_result_row_ids.clear();
+        self.window_thumbnails.clear();
+        self.window_id.take().map_or_else(Task::none, window::close)
+    }
+
+    fn refresh_niri(&mut self) -> Task<Message> {
+        if self.window_id.is_none() || !self.niri_dirty || self.niri_search_pending {
+            return Task::none();
+        }
+        let Some(registry) = self.registry.as_ref().map(Arc::clone) else {
+            return Task::none();
+        };
+        self.niri_dirty = false;
+        self.niri_search_pending = true;
+        self.niri_search_id += 1;
+        let request_id = self.niri_search_id;
+        let query = self.query.clone();
+        Task::perform(
+            background(move || {
+                registry
+                    .lock()
+                    .map_err(|_| "module registry lock poisoned".to_owned())?
+                    .search_niri(&query)
+                    .map_err(|error| error.to_string())
+            }),
+            move |result| Message::NiriSearchFinished { request_id, result },
+        )
+    }
+
+    fn merge_live_results(
+        &mut self,
+        keys: &[&str],
+        replacement: Vec<SearchResult>,
+    ) -> Task<Message> {
+        let mut results = self.results.clone();
+        results.retain(|result| !keys.contains(&result.module_key));
+        results.extend(replacement);
+        crate::module::sort_results(&mut results);
+        self.replace_live_results(results)
+    }
+
     fn refresh_codex_results(&mut self) -> Task<Message> {
         let mut results = self.results.clone();
         self.codex_sessions.merge_results(&self.query, &mut results);
+        self.replace_live_results(results)
+    }
+
+    fn replace_live_results(&mut self, results: Vec<SearchResult>) -> Task<Message> {
         if results == self.results {
             return Task::none();
         }
@@ -1024,10 +1239,16 @@ impl PickerApp {
 
         self.is_loading_icon_index = true;
 
-        Task::perform(async move { load_icon_index() }, Message::IconIndexFinished)
+        Task::perform(background(load_icon_index), Message::IconIndexFinished)
     }
 
     fn request_search(&mut self) -> Task<Message> {
+        if self.window_id.is_none() {
+            return Task::none();
+        }
+        self.niri_search_id += 1;
+        self.niri_search_pending = false;
+        self.niri_dirty = true;
         let Some(registry) = self.registry.as_ref().map(Arc::clone) else {
             return Task::none();
         };
@@ -1039,12 +1260,16 @@ impl PickerApp {
         let query = self.query.clone();
 
         Task::perform(
-            async move { search_registry(registry, &query) },
+            background(move || search_registry(registry, &query)),
             move |result| Message::SearchFinished { request_id, result },
         )
     }
 
     fn request_visible_window_thumbnails(&mut self) -> Task<Message> {
+        if self.window_id.is_none() {
+            return Task::none();
+        }
+        let generation = self.generation;
         let mut window_ids = Vec::new();
 
         for result in &self.results {
@@ -1071,8 +1296,12 @@ impl PickerApp {
 
         Task::batch(window_ids.into_iter().map(|window_id| {
             Task::perform(
-                async move { fetch_window_thumbnail(window_id) },
-                move |result| Message::WindowThumbnailFinished { window_id, result },
+                background(move || fetch_window_thumbnail(window_id)),
+                move |result| Message::WindowThumbnailFinished {
+                    generation,
+                    window_id,
+                    result,
+                },
             )
         }))
     }
@@ -1094,8 +1323,11 @@ impl PickerApp {
         };
 
         Task::perform(
-            async move { activate_result(registry, result, action_id) },
-            Message::ActivationFinished,
+            background(move || activate_result(registry, result, action_id)),
+            {
+                let generation = self.generation;
+                move |result| Message::ActivationCompleted { generation, result }
+            },
         )
     }
 
@@ -1114,7 +1346,7 @@ impl PickerApp {
                     self.schedule_selected_result_scroll(),
                 ])
             }
-            AppKey::Escape => iced::exit(),
+            AppKey::Escape => self.dismiss(),
             _ => Task::none(),
         }
     }
@@ -1160,7 +1392,7 @@ impl PickerApp {
                 focus(self.search_input_id.clone())
             }
             AppKey::Enter => self.activate_selected(DEFAULT_ACTION_ID),
-            AppKey::Escape => iced::exit(),
+            AppKey::Escape => self.dismiss(),
             AppKey::Shortcut(shortcut) => self
                 .selected_action_id_for_shortcut(shortcut)
                 .map_or_else(Task::none, |action_id| {
@@ -1257,6 +1489,15 @@ fn search_registry(
         .lock()
         .map_err(|_| "module registry lock poisoned".to_string())?;
     registry.search(query).map_err(|error| error.to_string())
+}
+
+/// Blocking module commands must not stall the persistent feed subscriptions.
+async fn background<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (sender, receiver) = iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver.await.expect("background module worker panicked")
 }
 
 fn activate_result(
@@ -1957,10 +2198,11 @@ fn theme_error() -> Color {
     color_from_hex(0xE18497)
 }
 
-fn load_startup_context(codex_sessions: SessionStore) -> StartupContext {
+fn load_startup_context(codex_sessions: SessionStore, niri: niri_feed::Store) -> StartupContext {
     StartupContext {
         registry: Arc::new(Mutex::new(ModuleRegistry::new(modules::default_modules(
             codex_sessions,
+            niri,
         )))),
     }
 }
@@ -1973,6 +2215,13 @@ mod tests {
 
     fn app_with_results(results: Vec<SearchResult>) -> PickerApp {
         PickerApp {
+            window_id: Some(window::Id::unique()),
+            generation: 1,
+            activation_server: None,
+            niri: niri_feed::Store::default(),
+            niri_dirty: false,
+            niri_search_id: 0,
+            niri_search_pending: false,
             window_is_focused: false,
             registry: Some(Arc::new(Mutex::new(ModuleRegistry::new(Vec::new())))),
             codex_sessions: SessionStore::default(),
@@ -2179,9 +2428,10 @@ mod tests {
     }
 
     #[test]
-    fn losing_window_focus_requests_exit() {
+    fn losing_window_focus_dismisses_without_stopping_the_feeds() {
         let mut app = app_with_results(Vec::new());
         let window = window::Id::unique();
+        app.window_id = Some(window);
 
         let focused = window_event_message(
             iced::Event::Window(window::Event::Focused),
@@ -2200,16 +2450,106 @@ mod tests {
         .unwrap();
         assert_eq!(update(&mut app, unfocused).units(), 1);
         assert!(!app.window_is_focused);
+        assert!(app.window_id.is_none());
     }
 
     #[test]
     fn an_initial_unfocused_event_does_not_close_the_starting_window() {
         let mut app = app_with_results(Vec::new());
+        let id = app.window_id.unwrap();
 
         assert_eq!(
-            update(&mut app, Message::WindowFocusChanged(false)).units(),
+            update(&mut app, Message::WindowFocusChanged(id, false)).units(),
             0
         );
+    }
+
+    #[test]
+    fn reopening_resets_the_query_and_thumbnail_cache_but_retains_indexes() {
+        let mut app = app_with_results(vec![window_result("42")]);
+        let registry = app.registry.as_ref().unwrap().clone();
+        app.query = "old query".to_owned();
+        app.window_thumbnails
+            .insert(42, WindowThumbnailState::Failed);
+        let old_window = app.window_id;
+        let _ = app.dismiss();
+        let _ = app.show();
+        assert!(app.window_id.is_some());
+        assert_ne!(app.window_id, old_window);
+        assert!(app.query.is_empty());
+        assert!(app.results.is_empty());
+        assert!(app.window_thumbnails.is_empty());
+        assert!(Arc::ptr_eq(app.registry.as_ref().unwrap(), &registry));
+    }
+
+    #[test]
+    fn old_window_events_and_activation_completions_cannot_dismiss_a_new_opening() {
+        let mut app = app_with_results(Vec::new());
+        let old_window = app.window_id.unwrap();
+        let generation = app.generation;
+        let _ = app.dismiss();
+        let _ = app.show();
+        let current_window = app.window_id;
+        app.window_is_focused = true;
+        let _ = update(&mut app, Message::WindowFocusChanged(old_window, false));
+        let _ = update(&mut app, Message::WindowClosed(old_window));
+        let _ = update(
+            &mut app,
+            Message::ActivationCompleted {
+                generation,
+                result: Ok(ActivationOutcome::ClosePicker),
+            },
+        );
+        assert_eq!(app.window_id, current_window);
+        assert!(app.window_is_focused);
+    }
+
+    #[test]
+    fn thumbnail_completions_from_an_earlier_opening_are_discarded() {
+        let mut app = app_with_results(Vec::new());
+        let generation = app.generation;
+        let _ = app.dismiss();
+        let _ = app.show();
+        let _ = update(
+            &mut app,
+            Message::WindowThumbnailFinished {
+                generation,
+                window_id: 42,
+                result: Err("old request".to_owned()),
+            },
+        );
+        assert!(app.window_thumbnails.is_empty());
+    }
+
+    #[test]
+    fn hidden_niri_updates_keep_the_index_warm_without_searching() {
+        let mut app = app_with_results(Vec::new());
+        let _ = app.dismiss();
+        assert_eq!(update(&mut app, Message::NiriChanged(Ok(json!({
+            "WindowsChanged": { "windows": [{"id": 42, "title": "Warm", "workspace_id": 1}] }
+        })))).units(), 0);
+        assert_eq!(
+            app.niri.windows::<serde_json::Value>().unwrap().unwrap()[0]["title"],
+            "Warm"
+        );
+        assert_eq!(update(&mut app, Message::NiriTick).units(), 0);
+        assert!(app.niri_dirty);
+    }
+
+    #[test]
+    fn live_niri_updates_preserve_the_selected_window_and_other_modules() {
+        let mut app = app_with_results(vec![
+            window_result("42"),
+            window_result("43"),
+            result("App", Vec::new()),
+        ]);
+        app.focus_target = FocusTarget::Results;
+        app.selected_index = Some(1);
+        let mut changed = window_result("43");
+        changed.title = "Changed title".to_owned();
+        let _ = app.merge_live_results(&["niri-windows", "niri-workspaces"], vec![changed]);
+        assert_eq!(app.selected_result().unwrap().item_id, "43");
+        assert!(app.results.iter().any(|result| result.title == "App"));
     }
 
     #[test]

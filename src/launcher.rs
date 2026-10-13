@@ -1,8 +1,12 @@
 use std::env;
 use std::fs::{File, OpenOptions, TryLockError};
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,14 +22,113 @@ pub fn run() -> Result<()> {
         .or_else(|| env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("picky.lock")))
         .context("NIRI_SOCKET or XDG_RUNTIME_DIR must be set")?;
 
-    if let Some(_instance) = acquire_or_focus(
-        &lock_path,
-        STARTUP_TIMEOUT,
-        crate::modules::niri_windows::focus_picker_window,
-    )? {
-        crate::app::run().context("failed to launch picky")?;
+    let socket_path = lock_path.with_extension("socket");
+    if env::args().any(|argument| argument == "--quit") {
+        send_request(&socket_path, b'Q')?;
+        return Ok(());
+    }
+    if let Some(_instance) =
+        acquire_or_focus(&lock_path, STARTUP_TIMEOUT, |_| {
+            match send_request(&socket_path, b'A') {
+                Ok(()) => Ok(true),
+                Err(_) => Ok(false),
+            }
+        })?
+    {
+        // Only the lock owner can replace a socket left behind by a crash.
+        match std::fs::remove_file(&socket_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let listener = UnixListener::bind(&socket_path)?;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+        let server = Arc::new(ActivationServer {
+            path: socket_path,
+            listener: async_io::Async::new(listener)?,
+        });
+        crate::app::run(server).context("failed to launch picky")?;
     }
 
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct ActivationServer {
+    path: PathBuf,
+    listener: async_io::Async<UnixListener>,
+}
+
+impl Hash for ActivationServer {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.path.hash(state);
+    }
+}
+
+impl Drop for ActivationServer {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Request {
+    Activate,
+    Quit,
+    Failed(String),
+}
+
+pub fn subscription(server: Arc<ActivationServer>) -> iced::Subscription<Request> {
+    iced::Subscription::run_with(server, requests)
+}
+
+fn requests(server: &Arc<ActivationServer>) -> impl iced::futures::Stream<Item = Request> + use<> {
+    use iced::futures::SinkExt;
+    use iced::futures::io::{AsyncReadExt, AsyncWriteExt};
+    let server = server.clone();
+    iced::stream::channel(16, async move |mut output| {
+        loop {
+            let (stream, _) = match server.listener.accept().await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    let _ = output.send(Request::Failed(error.to_string())).await;
+                    return;
+                }
+            };
+            // A malformed local client cannot indefinitely block activation.
+            let mut stream = &stream;
+            let mut command = [0];
+            let read = stream.read_exact(&mut command);
+            let timer = async_io::Timer::after(Duration::from_secs(1));
+            if !matches!(
+                iced::futures::future::select(Box::pin(read), Box::pin(timer)).await,
+                iced::futures::future::Either::Left((Ok(_), _))
+            ) {
+                continue;
+            }
+            let request = match command[0] {
+                b'A' => Request::Activate,
+                b'Q' => Request::Quit,
+                _ => continue,
+            };
+            if output.send(request).await.is_err() {
+                return;
+            }
+            let _ = stream.write_all(b"OK").await;
+        }
+    })
+}
+
+fn send_request(path: &Path, command: u8) -> Result<()> {
+    let mut stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    stream.write_all(&[command])?;
+    let mut reply = [0; 2];
+    stream.read_exact(&mut reply)?;
+    if &reply != b"OK" {
+        bail!("invalid activation reply");
+    }
     Ok(())
 }
 
@@ -50,7 +153,7 @@ fn acquire_or_focus(
                 lock.set_len(0)?;
                 lock.rewind()?;
                 writeln!(lock, "{}", std::process::id())?;
-                // Keep this descriptor alive until the UI exits. Leave the file in
+                // Keep this descriptor alive until the resident process exits. Leave the file in
                 // place so every launch locks the same inode, even after a crash.
                 return Ok(Some(lock));
             }
@@ -74,11 +177,11 @@ fn acquire_or_focus(
         }
 
         if Instant::now() >= deadline {
-            bail!("timed out waiting for the existing picky window");
+            bail!("timed out waiting for the existing picky instance to respond");
         }
 
-        // The owner may still be creating its window, or may be exiting. Retry
-        // both the lock and the focus request so a relaunch can take over.
+        // The owner may still be starting its listener, or may be exiting. Retry
+        // both the lock and the activation request so a relaunch can take over.
         thread::sleep(STARTUP_POLL_INTERVAL);
     }
 }
@@ -116,6 +219,29 @@ mod tests {
         })
         .unwrap()
         .unwrap()
+    }
+
+    #[test]
+    fn resident_socket_delivers_activation_and_quit_and_is_removed_on_drop() {
+        use iced::futures::{StreamExt, executor::block_on};
+        let path = TestLock::new();
+        let server = Arc::new(ActivationServer {
+            path: path.0.clone(),
+            listener: async_io::Async::new(UnixListener::bind(&path.0).unwrap()).unwrap(),
+        });
+        let client_path = path.0.clone();
+        let client = thread::spawn(move || {
+            send_request(&client_path, b'A').unwrap();
+            send_request(&client_path, b'Q').unwrap();
+        });
+        let received = block_on(requests(&server).take(2).collect::<Vec<_>>());
+        assert!(matches!(
+            received.as_slice(),
+            [Request::Activate, Request::Quit]
+        ));
+        client.join().unwrap();
+        drop(server);
+        assert!(!path.0.exists());
     }
 
     #[test]

@@ -175,7 +175,7 @@ fn feed_command(mut command: Command) -> async_process::Command {
 }
 
 #[cfg(target_os = "linux")]
-fn stop_with_parent(command: &mut Command) {
+pub(super) fn stop_with_parent(command: &mut Command) {
     use std::os::unix::process::CommandExt;
 
     let parent = std::process::id() as libc::pid_t;
@@ -196,7 +196,7 @@ fn stop_with_parent(command: &mut Command) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn stop_with_parent(_command: &mut Command) {}
+pub(super) fn stop_with_parent(_command: &mut Command) {}
 
 fn watch() -> impl Stream<Item = FeedUpdate> {
     watch_with_command(watch_command, RESTART_DELAY)

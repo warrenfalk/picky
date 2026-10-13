@@ -21,6 +21,7 @@ const CLOSE_POLL_TIMEOUT: Duration = Duration::from_millis(750);
 const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct NiriWindowsModule {
+    store: Option<super::niri_feed::Store>,
     application_index: HashMap<String, ApplicationMetadata>,
     backend: Box<dyn WindowsBackend>,
 }
@@ -89,6 +90,11 @@ impl WindowsBackend for ProcessWindowsBackend {
 }
 
 impl NiriWindowsModule {
+    pub fn with_store(store: super::niri_feed::Store) -> Self {
+        let mut module = Self::new();
+        module.store = Some(store);
+        module
+    }
     pub fn new() -> Self {
         let application_index = crate::modules::applications::load_application_index()
             .unwrap_or_else(|err| {
@@ -104,6 +110,7 @@ impl NiriWindowsModule {
         backend: Box<dyn WindowsBackend>,
     ) -> Self {
         Self {
+            store: None,
             application_index,
             backend,
         }
@@ -172,10 +179,15 @@ impl Module for NiriWindowsModule {
 
     fn search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
         let query = query.trim();
-        let windows = self.backend.load_windows()?;
+        let windows = match self.store.as_ref().and_then(|store| store.windows()) {
+            Some(windows) => windows?,
+            None => self.backend.load_windows()?,
+        };
         let workspaces = self
-            .backend
-            .load_workspaces()?
+            .store
+            .as_ref()
+            .and_then(|store| store.workspaces())
+            .unwrap_or_else(|| self.backend.load_workspaces())?
             .into_iter()
             .map(|workspace| (workspace.id, workspace))
             .collect::<HashMap<_, _>>();

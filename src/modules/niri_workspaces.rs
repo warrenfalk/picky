@@ -9,6 +9,7 @@ use crate::module::{ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, Sea
 const MODULE_KEY: &str = "niri-workspaces";
 
 pub struct NiriWorkspacesModule {
+    store: Option<super::niri_feed::Store>,
     backend: Box<dyn WorkspaceBackend>,
 }
 
@@ -42,12 +43,19 @@ impl WorkspaceBackend for ProcessWorkspaceBackend {
 }
 
 impl NiriWorkspacesModule {
-    pub fn new() -> Self {
-        Self::with_backend(Box::new(ProcessWorkspaceBackend))
+    pub fn with_store(store: super::niri_feed::Store) -> Self {
+        Self {
+            store: Some(store),
+            backend: Box::new(ProcessWorkspaceBackend),
+        }
     }
 
+    #[cfg(test)]
     fn with_backend(backend: Box<dyn WorkspaceBackend>) -> Self {
-        Self { backend }
+        Self {
+            store: None,
+            backend,
+        }
     }
 }
 
@@ -58,7 +66,11 @@ impl Module for NiriWorkspacesModule {
 
     fn search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
         let query = query.trim();
-        let mut workspaces = self.backend.load_workspaces()?;
+        let mut workspaces = self
+            .store
+            .as_ref()
+            .and_then(|store| store.workspaces())
+            .unwrap_or_else(|| self.backend.load_workspaces())?;
 
         workspaces.sort_by(|left, right| {
             left.output

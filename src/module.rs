@@ -69,6 +69,17 @@ impl ModuleRegistry {
         self.activate_action(result, DEFAULT_ACTION_ID)
     }
 
+    pub fn search_niri(&mut self, query: &str) -> Result<Vec<SearchResult>> {
+        let mut results = Vec::new();
+        for module in &mut self.modules {
+            if matches!(module.key(), "niri-windows" | "niri-workspaces") {
+                results.extend(module.search(query)?);
+            }
+        }
+        sort_results(&mut results);
+        Ok(results)
+    }
+
     pub fn activate_action(
         &mut self,
         result: &SearchResult,
