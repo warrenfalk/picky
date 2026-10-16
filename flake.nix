@@ -59,6 +59,7 @@
           pkgs.firefox
           pkgs.gtk3
           pkgs.niri
+          pkgs.xdg-utils
         ];
         rustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
           extensions = [
@@ -135,6 +136,7 @@
             weston
             wl-clipboard
             wtype
+            xdg-utils
             ydotool
           ];
 

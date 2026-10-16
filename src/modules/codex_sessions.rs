@@ -125,14 +125,29 @@ impl Module for CodexSessionsModule {
             action_id == DEFAULT_ACTION_ID,
             "Unknown Codex action: {action_id}"
         );
-        let output = focus_command(item_id)
+        let focus = focus_command(item_id)
             .output()
-            .context("failed to run `codex agents --focus`")?;
-        ensure!(
-            output.status.success(),
-            "Could not focus Codex session: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+            .context("failed to run `codex agents --focus`")
+            .and_then(|output| {
+                ensure!(
+                    output.status.success(),
+                    "Could not focus Codex session: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                Ok(())
+            });
+        if let Err(focus_error) = focus {
+            let output = Command::new("xdg-open")
+                .arg(format!("https://agent.warrenfalk.com/#{item_id}"))
+                .stdin(Stdio::null())
+                .output()
+                .with_context(|| format!("{focus_error}; failed to run `xdg-open`"))?;
+            ensure!(
+                output.status.success(),
+                "{focus_error}; could not open Codex session in browser: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
         Ok(ActivationOutcome::ClosePicker)
     }
 }
