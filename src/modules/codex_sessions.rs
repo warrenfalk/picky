@@ -21,12 +21,13 @@ const IDLE_SCORE_PENALTY: i64 = 1_000;
 
 pub type FeedUpdate = Result<Vec<Session>, String>;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SessionIndicator {
     Error,
     Approval,
     Input,
     Attention,
+    Unread,
     Working,
     Idle,
 }
@@ -306,8 +307,10 @@ impl Session {
                 return indicator;
             }
         }
-        if !self.attention.is_empty() {
+        if self.attention.iter().any(|reason| reason != "unread") {
             SessionIndicator::Attention
+        } else if self.attention.iter().any(|reason| reason == "unread") {
+            SessionIndicator::Unread
         } else if self.working {
             SessionIndicator::Working
         } else {
@@ -345,12 +348,16 @@ impl Session {
                 labels.push(label);
             }
         }
-        if self
-            .attention
-            .iter()
-            .any(|reason| !matches!(reason.as_str(), "error" | "approval" | "userInput"))
-        {
+        if self.attention.iter().any(|reason| {
+            !matches!(
+                reason.as_str(),
+                "error" | "approval" | "userInput" | "unread"
+            )
+        }) {
             labels.push("Attention");
+        }
+        if self.attention.iter().any(|reason| reason == "unread") {
+            labels.push("Unread");
         }
         if self.working {
             labels.push("Working");
@@ -396,9 +403,8 @@ fn parse_snapshot(line: &str) -> Result<Vec<Session>> {
     );
     sessions.retain(Session::is_visible);
     sessions.sort_by(|left, right| {
-        right
-            .is_active()
-            .cmp(&left.is_active())
+        left.indicator()
+            .cmp(&right.indicator())
             .then_with(|| {
                 if left.is_active() {
                     std::cmp::Ordering::Equal
@@ -486,6 +492,56 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, ["attention", "working", "image", "legacy", "named"]);
         assert!(sessions.iter().all(|session| session.preview.is_none()));
+    }
+
+    #[test]
+    fn ranks_unread_between_other_attention_and_working_and_updates_live() {
+        let mut working = session("a-working");
+        working["working"] = json!(true);
+        let mut unread = session("b-unread");
+        unread["attention"] = json!(["unread"]);
+        let mut other = session("c-other");
+        other["attention"] = json!(["unread", "futureReason"]);
+        let mut input = session("d-input");
+        input["attention"] = json!(["unread", "userInput"]);
+        let store = SessionStore::default();
+        for query in ["", "codex"] {
+            store.replace(parse(vec![
+                working.clone(),
+                unread.clone(),
+                other.clone(),
+                input.clone(),
+            ]));
+            let mut results = store.search(query);
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|result| result.item_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["d-input", "c-other", "b-unread", "a-working"]
+            );
+            assert_eq!(store.indicator("b-unread"), Some(SessionIndicator::Unread));
+            assert_eq!(
+                store.indicator("c-other"),
+                Some(SessionIndicator::Attention)
+            );
+            assert_eq!(store.indicator("d-input"), Some(SessionIndicator::Input));
+            assert!(results[2].subtitle.contains("| Unread |"));
+
+            let mut acknowledged = unread.clone();
+            acknowledged["attention"] = json!([]);
+            store.replace(parse(vec![
+                working.clone(),
+                acknowledged,
+                other.clone(),
+                input.clone(),
+            ]));
+            store.merge_results(query, &mut results);
+            assert_eq!(results.last().unwrap().item_id, "b-unread");
+            assert_eq!(store.indicator("b-unread"), Some(SessionIndicator::Idle));
+        }
+        store.replace(parse(vec![unread]));
+        assert_eq!(store.search("unread").len(), 1);
     }
 
     #[test]

@@ -21,8 +21,9 @@ refresh results. Thumbnails are fetched only for visible rows and regenerated
 on each opening. Sources without live feeds are searched again on opening;
 application entries and icon indexes remain cached for the process lifetime.
 
-With an empty query, working and attention-needed sessions appear near the top,
-below notifications. Idle sessions appear below applications, windows, and
+With an empty query, sessions appear below notifications in this order: error,
+approval, input, other attention, unread, then working.
+Idle sessions appear below applications, windows, and
 workspaces, ordered by `updatedAt`, newest first. Unloaded idle history
 and unnamed, empty idle drafts are hidden, matching Waybar. The CLI aggregates
 subagents into their root session, so Picky does not list family members twice.
@@ -38,8 +39,9 @@ selection moves to the nearest remaining row.
 Status icons use both shape and color: a green play icon for working, a muted
 pause icon for idle, a red cross for errors, an amber exclamation mark for
 approval, a blue speech bubble for input, and a purple exclamation mark for
-other attention. When a family has multiple statuses, the icon uses Waybar's
-priority: error, approval, input, other attention, working, then idle. The
+other attention, plus a blue dot for unread. When a family has multiple statuses,
+the icon uses this priority: error, approval, input, other attention, unread,
+working, then idle. Equally relevant search results use this order too. The
 subtitle still shows every status. Icons update with the live feed.
 
 Enter or a click runs `codex agents --local unix:// --focus=SESSION_ID`. This

@@ -1642,6 +1642,7 @@ fn leading_visual(
 fn codex_status_icon(indicator: SessionIndicator) -> Element<'static, Message> {
     let (color, path) = match indicator {
         SessionIndicator::Working => (0x83DFA0, "M8 5L20 12L8 19Z"),
+        SessionIndicator::Unread => (0x91BFFF, "M12 5A7 7 0 1 0 12 19A7 7 0 1 0 12 5Z"),
         SessionIndicator::Idle => (0x9CA7BF, "M7 6H10V18H7Z M14 6H17V18H14Z"),
         SessionIndicator::Error => (
             0xF08B9A,
