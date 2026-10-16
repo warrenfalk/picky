@@ -93,7 +93,10 @@ enum Message {
     ActivateSelectedAction(&'static str),
     ResultActivated(usize),
     ResultsScrolled(Viewport),
-    EnsureSelectedResultVisible(u64),
+    MeasureResultVisibility {
+        request_id: u64,
+        reveal_selected: bool,
+    },
     SelectedResultVisibilityMeasured {
         request_id: u64,
         measured: MeasuredSelectedResultVisibility,
@@ -495,9 +498,10 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
             app.visible_result_row_ids = app.visible_result_row_ids_for_viewport(viewport);
             app.request_visible_window_thumbnails()
         }
-        Message::EnsureSelectedResultVisible(request_id) => {
-            app.measure_selected_result_visibility(request_id)
-        }
+        Message::MeasureResultVisibility {
+            request_id,
+            reveal_selected,
+        } => app.measure_selected_result_visibility(request_id, reveal_selected),
         Message::SelectedResultVisibilityMeasured {
             request_id,
             measured,
@@ -949,13 +953,13 @@ struct MeasuredSelectedResultVisibility {
 struct MeasureSelectedResultVisibilityOperation {
     scrollable_id: Id,
     tracked_row_ids: HashSet<Id>,
-    row_id: Id,
+    row_id: Option<Id>,
     scrollable: Option<ScrollableSnapshot>,
     row_bounds: HashMap<Id, Rectangle>,
 }
 
 impl MeasureSelectedResultVisibilityOperation {
-    fn new(scrollable_id: Id, tracked_row_ids: HashSet<Id>, row_id: Id) -> Self {
+    fn new(scrollable_id: Id, tracked_row_ids: HashSet<Id>, row_id: Option<Id>) -> Self {
         Self {
             scrollable_id,
             tracked_row_ids,
@@ -1024,15 +1028,19 @@ impl Operation<MeasuredSelectedResultVisibility> for MeasureSelectedResultVisibi
             })
             .collect::<HashMap<_, _>>();
 
-        let target_offset_y = row_bounds.get(&self.row_id).and_then(|row_bounds| {
-            scroll_offset_to_reveal_row(
-                scrollable.bounds.height,
-                scrollable.content_bounds.height,
-                scrollable.offset.y,
-                row_bounds.top,
-                row_bounds.height,
-            )
-        });
+        let target_offset_y = self
+            .row_id
+            .as_ref()
+            .and_then(|id| row_bounds.get(id))
+            .and_then(|row_bounds| {
+                scroll_offset_to_reveal_row(
+                    scrollable.bounds.height,
+                    scrollable.content_bounds.height,
+                    scrollable.offset.y,
+                    row_bounds.top,
+                    row_bounds.height,
+                )
+            });
         let visible_row_ids = visible_row_ids_for_viewport(
             scrollable.bounds.height,
             scrollable.offset.y,
@@ -1228,7 +1236,12 @@ impl PickerApp {
             self.focus_target = FocusTarget::Search;
             focus(self.search_input_id.clone())
         } else {
-            self.schedule_selected_result_scroll()
+            // Live data must refresh row geometry without undoing manual scrolling.
+            self.invalidate_selected_result_scroll();
+            Task::done(Message::MeasureResultVisibility {
+                request_id: self.selected_result_visibility_request_id,
+                reveal_selected: false,
+            })
         }
     }
 
@@ -1429,7 +1442,10 @@ impl PickerApp {
         // scroll has been applied, and the later optimistic scroll can leave
         // the selected row only partially visible.
         self.scroll_selected_result_into_view_from_cache()
-            .chain(Task::done(Message::EnsureSelectedResultVisible(request_id)))
+            .chain(Task::done(Message::MeasureResultVisibility {
+                request_id,
+                reveal_selected: true,
+            }))
     }
 
     fn scroll_selected_result_into_view_from_cache(&self) -> Task<Message> {
@@ -1456,23 +1472,34 @@ impl PickerApp {
         )
     }
 
-    fn measure_selected_result_visibility(&self, request_id: u64) -> Task<Message> {
-        let Some(result) = self.selected_result() else {
-            return Task::none();
-        };
-
+    fn result_visibility_operation(
+        &self,
+        reveal_selected: bool,
+    ) -> MeasureSelectedResultVisibilityOperation {
         let scrollable_id = self.results_scroll_id.clone();
-        let row_id = row_widget_id(result);
+        let row_id = self
+            .selected_result()
+            .filter(|_| reveal_selected)
+            .map(row_widget_id);
         let tracked_row_ids = self.results.iter().map(row_widget_id).collect();
 
-        operate(MeasureSelectedResultVisibilityOperation::new(
-            scrollable_id.clone(),
-            tracked_row_ids,
-            row_id,
-        ))
-        .map(move |measured| Message::SelectedResultVisibilityMeasured {
-            request_id,
-            measured,
+        MeasureSelectedResultVisibilityOperation::new(scrollable_id, tracked_row_ids, row_id)
+    }
+
+    fn measure_selected_result_visibility(
+        &self,
+        request_id: u64,
+        reveal_selected: bool,
+    ) -> Task<Message> {
+        if request_id != self.selected_result_visibility_request_id {
+            return Task::none();
+        }
+
+        operate(self.result_visibility_operation(reveal_selected)).map(move |measured| {
+            Message::SelectedResultVisibilityMeasured {
+                request_id,
+                measured,
+            }
         })
     }
 }
@@ -2713,6 +2740,116 @@ mod tests {
         );
 
         assert_eq!(app.results[0].title, "Old");
+    }
+
+    #[test]
+    fn live_result_measurement_preserves_manual_scroll_and_tracks_visible_rows() {
+        for focus_target in [FocusTarget::Search, FocusTarget::Results] {
+            let mut app = app_with_results(vec![result("Firefox", Vec::new())]);
+            let _ = update(
+                &mut app,
+                Message::CodexSessionsChanged(codex_update("session", "Old title")),
+            );
+            app.focus_target = focus_target;
+            let _ = update(
+                &mut app,
+                Message::CodexSessionsChanged(codex_update("session", "Task")),
+            );
+
+            // The selected session is above a viewport manually scrolled down to Firefox.
+            let selected_index = app.selected_index.unwrap();
+            let selected_id = row_widget_id(&app.results[selected_index]);
+            let visible_id = row_widget_id(&app.results[1 - selected_index]);
+            let measured = measure_scrolled_results(&app, false);
+
+            assert_eq!(measured.target_offset_y, None);
+            assert!(measured.row_bounds.contains_key(&selected_id));
+            assert!(measured.visible_row_ids.contains(&visible_id));
+
+            let request_id = app.selected_result_visibility_request_id;
+            let task = update(
+                &mut app,
+                Message::SelectedResultVisibilityMeasured {
+                    request_id,
+                    measured,
+                },
+            );
+            assert_eq!(task.units(), 0, "background measurement must not scroll");
+        }
+    }
+
+    #[test]
+    fn keyboard_result_measurement_still_reveals_selection() {
+        let app = app_with_results(vec![
+            result("Selected", Vec::new()),
+            result("Visible", Vec::new()),
+        ]);
+        let measured = measure_scrolled_results(&app, true);
+
+        assert_eq!(measured.target_offset_y, Some(0.0));
+    }
+
+    fn measure_scrolled_results(
+        app: &PickerApp,
+        reveal_selected: bool,
+    ) -> MeasuredSelectedResultVisibility {
+        let mut operation = app.result_visibility_operation(reveal_selected);
+        operation.scrollable = Some(ScrollableSnapshot {
+            bounds: Rectangle {
+                height: 100.0,
+                ..Rectangle::default()
+            },
+            content_bounds: Rectangle {
+                height: 500.0,
+                ..Rectangle::default()
+            },
+            offset: Vector::new(0.0, 200.0),
+        });
+        for (index, result) in app.results.iter().enumerate() {
+            operation.container(
+                Some(&row_widget_id(result)),
+                Rectangle {
+                    y: index as f32 * 220.0,
+                    height: 40.0,
+                    ..Rectangle::default()
+                },
+            );
+        }
+        let Outcome::Some(measured) = operation.finish() else {
+            panic!("expected measured results");
+        };
+        measured
+    }
+
+    #[test]
+    fn live_update_cancels_pending_selection_scroll() {
+        let mut app = app_with_results(vec![result("Firefox", Vec::new())]);
+        let _ = app.schedule_selected_result_scroll();
+        let old_request_id = app.selected_result_visibility_request_id;
+        let _ = update(
+            &mut app,
+            Message::CodexSessionsChanged(codex_update("session", "Task")),
+        );
+
+        let task = update(
+            &mut app,
+            Message::MeasureResultVisibility {
+                request_id: old_request_id,
+                reveal_selected: true,
+            },
+        );
+        assert_eq!(task.units(), 0);
+
+        let measured = measure_scrolled_results(&app, true);
+        assert_eq!(measured.target_offset_y, Some(0.0));
+        let task = update(
+            &mut app,
+            Message::SelectedResultVisibilityMeasured {
+                request_id: old_request_id,
+                measured,
+            },
+        );
+        assert_eq!(task.units(), 0);
     }
 
     #[test]
