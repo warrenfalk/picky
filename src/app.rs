@@ -89,6 +89,11 @@ enum Message {
         generation: u64,
         result: Result<ActivationOutcome, String>,
     },
+    ActionSettled {
+        key: PendingAction,
+        generation: u64,
+        result: Result<ActivationOutcome, String>,
+    },
     QueryChanged(String),
     ActivateSelected,
     ActivateSelectedAction(&'static str),
@@ -120,7 +125,10 @@ enum Message {
     ActivationFinished(Result<ActivationOutcome, String>),
 }
 
+type PendingAction = (&'static str, String, &'static str);
+
 pub struct PickerApp {
+    pending_actions: HashSet<PendingAction>,
     window_id: Option<window::Id>,
     generation: u64,
     activation_server: Option<Arc<ActivationServer>>,
@@ -283,6 +291,7 @@ fn initialize(server: Arc<ActivationServer>) -> (PickerApp, Task<Message>) {
     let notifications = NotificationStore::default();
     let startup_notifications = notifications.clone();
     let mut app = PickerApp {
+        pending_actions: HashSet::new(),
         window_id: None,
         generation: 0,
         activation_server: Some(server),
@@ -471,6 +480,14 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
                     Task::none()
                 }
             }
+        }
+        Message::ActionSettled {
+            key,
+            generation,
+            result,
+        } => {
+            app.pending_actions.remove(&key);
+            update(app, Message::ActivationCompleted { generation, result })
         }
         Message::ActivationCompleted { generation, result } => {
             if generation != app.generation || app.window_id.is_none() {
@@ -741,6 +758,12 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
                     ),
                     window_thumbnail: window_thumbnail_for_result(result, &app.window_thumbnails),
                     is_selected: app.selected_index == Some(index),
+                    pending_actions: result
+                        .actions
+                        .iter()
+                        .filter(|action| app.action_is_pending(result, action.id))
+                        .map(|action| action.id)
+                        .collect(),
                     show_action_hints: app.selected_index == Some(index)
                         && app.focus_target == FocusTarget::Results,
                 };
@@ -832,6 +855,7 @@ struct ResultRowView {
     window_thumbnail: Option<CachedWindowThumbnail>,
     is_selected: bool,
     show_action_hints: bool,
+    pending_actions: Vec<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -873,7 +897,11 @@ fn view_result_row(row_state: &ResultRowView) -> Element<'static, Message> {
             .actions
             .iter()
             .fold(row![].spacing(8), |row, action| {
-                row.push(view_action_chip(action, is_selected))
+                row.push(view_action_chip(
+                    action,
+                    is_selected,
+                    row_state.pending_actions.contains(&action.id),
+                ))
             });
 
         text_column = text_column.push(action_row);
@@ -1374,12 +1402,20 @@ impl PickerApp {
         let Some(registry) = self.registry.as_ref().map(Arc::clone) else {
             return Task::none();
         };
+        let key = (result.module_key, result.item_id.clone(), action_id);
+        if !self.pending_actions.insert(key.clone()) {
+            return Task::none();
+        }
 
         Task::perform(
             background(move || activate_result(registry, result, action_id)),
             {
                 let generation = self.generation;
-                move |result| Message::ActivationCompleted { generation, result }
+                move |result| Message::ActionSettled {
+                    key: key.clone(),
+                    generation,
+                    result,
+                }
             },
         )
     }
@@ -1387,6 +1423,11 @@ impl PickerApp {
     fn selected_result(&self) -> Option<&SearchResult> {
         self.selected_index
             .and_then(|index| self.results.get(index))
+    }
+
+    fn action_is_pending(&self, result: &SearchResult, action_id: &'static str) -> bool {
+        self.pending_actions
+            .contains(&(result.module_key, result.item_id.clone(), action_id))
     }
 
     fn handle_search_key(&mut self, key: AppKey) -> Task<Message> {
@@ -1457,10 +1498,14 @@ impl PickerApp {
     fn selected_action_id_for_shortcut(&self, shortcut: char) -> Option<&'static str> {
         let shortcut = shortcut.to_ascii_lowercase();
 
-        self.selected_result()?
+        let result = self.selected_result()?;
+        result
             .actions
             .iter()
-            .find(|action| action.shortcut.to_ascii_lowercase() == shortcut)
+            .find(|action| {
+                action.shortcut.to_ascii_lowercase() == shortcut
+                    && !self.action_is_pending(result, action.id)
+            })
             .map(|action| action.id)
     }
 
@@ -2015,8 +2060,14 @@ fn kind_symbol(result: &SearchResult) -> &'static str {
     }
 }
 
-fn view_action_chip(action: &ResultAction, is_selected: bool) -> Element<'static, Message> {
-    let label_color = if is_selected {
+fn view_action_chip(
+    action: &ResultAction,
+    is_selected: bool,
+    is_pending: bool,
+) -> Element<'static, Message> {
+    let label_color = if is_pending {
+        color_from_rgba_hex(0xD9E3FF, 0.5)
+    } else if is_selected {
         color_from_hex(0xF7FAFF)
     } else {
         theme_text()
@@ -2030,15 +2081,13 @@ fn view_action_chip(action: &ResultAction, is_selected: bool) -> Element<'static
 
     container(
         row![
-            container(
-                text(action.shortcut.to_string())
-                    .size(12)
-                    .color(if is_selected {
-                        label_color
-                    } else {
-                        theme_blue()
-                    }),
-            )
+            container(text(action.shortcut.to_string()).size(12).color(
+                if is_selected || is_pending {
+                    label_color
+                } else {
+                    theme_blue()
+                }
+            ),)
             .padding([4, 8])
             .style(move |_| {
                 container::Style::default()
@@ -2288,6 +2337,7 @@ mod tests {
 
     fn app_with_results(results: Vec<SearchResult>) -> PickerApp {
         PickerApp {
+            pending_actions: HashSet::new(),
             window_id: Some(window::Id::unique()),
             generation: 1,
             activation_server: None,
@@ -2872,6 +2922,77 @@ mod tests {
 
         assert_eq!(app.focus_target, FocusTarget::Search);
         assert_eq!(app.selected_index, Some(0));
+    }
+
+    #[test]
+    fn pending_action_ignores_repeats_and_reenables_after_success_or_error() {
+        for outcome in [
+            Ok(ActivationOutcome::RefreshResults),
+            Err("failed".to_owned()),
+        ] {
+            let mut app = app_with_results(vec![result(
+                "Unread",
+                vec![ResultAction {
+                    id: "acknowledge",
+                    label: "Acknowledge",
+                    shortcut: 'a',
+                }],
+            )]);
+            let generation = app.generation;
+            assert_eq!(app.activate_selected("acknowledge").units(), 1);
+            let key = ("test", "Unread".to_owned(), "acknowledge");
+            assert!(app.pending_actions.contains(&key));
+            assert_eq!(app.selected_action_id_for_shortcut('a'), None);
+            assert_eq!(app.handle_results_key(AppKey::Shortcut('a')).units(), 0);
+            assert_eq!(app.activate_selected("acknowledge").units(), 0);
+            let _ = update(
+                &mut app,
+                Message::ActionSettled {
+                    key,
+                    generation,
+                    result: outcome,
+                },
+            );
+            assert!(app.pending_actions.is_empty());
+            assert_eq!(
+                app.selected_action_id_for_shortcut('a'),
+                Some("acknowledge")
+            );
+        }
+    }
+
+    #[test]
+    fn pending_action_follows_identity_across_reorder_and_reopening() {
+        let mut app = app_with_results(vec![
+            result("First", Vec::new()),
+            result("Second", Vec::new()),
+        ]);
+        let generation = app.generation;
+        let _ = app.activate_selected("acknowledge");
+        app.results.swap(0, 1);
+        assert_eq!(app.activate_selected("acknowledge").units(), 1);
+        app.selected_index = Some(1);
+        assert_eq!(app.activate_selected("acknowledge").units(), 0);
+        let _ = app.dismiss();
+        let _ = app.show();
+        let window = app.window_id;
+        let _ = update(
+            &mut app,
+            Message::ActionSettled {
+                key: ("test", "First".to_owned(), "acknowledge"),
+                generation,
+                result: Ok(ActivationOutcome::ClosePicker),
+            },
+        );
+        assert_eq!(app.window_id, window);
+        assert!(
+            !app.pending_actions
+                .contains(&("test", "First".to_owned(), "acknowledge"))
+        );
+        assert!(
+            app.pending_actions
+                .contains(&("test", "Second".to_owned(), "acknowledge"))
+        );
     }
 
     #[test]

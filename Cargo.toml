@@ -8,6 +8,7 @@ default-run = "picky"
 anyhow = "1.0"
 async-io = "2.6"
 async-process = "2.5"
+async-tungstenite = { version = "0.32", default-features = false, features = ["handshake", "futures-03-sink"] }
 base64 = "0.22"
 iced = { version = "0.14.0", features = ["advanced", "image", "lazy", "svg", "sysinfo"] }
 libc = "0.2"

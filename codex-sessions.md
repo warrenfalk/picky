@@ -44,6 +44,16 @@ the icon uses this priority: error, approval, input, other attention, unread,
 working, then idle. Equally relevant search results use this order too. The
 subtitle still shows every status. Icons update with the live feed.
 
+Unread rows offer an Acknowledge action (`a` in the action menu). It sends
+`thread/unread/set` over WebSocket through `codex app-server proxy` without opening the session
+and keeps Picky open. The live feed updates the row after acknowledgement.
+If the session or a descendant is active again, Codex ignores the acknowledgement
+and Picky reports that it was not applied. Proxy failures and timeouts are shown
+as action errors; Picky never clears unread optimistically.
+While an action is pending, its hint is dimmed, and repeated
+shortcut presses are ignored. This follows the item across live reordering and
+window reopening; completion or failure enables the action again.
+
 Enter or a click runs `codex agents --local unix:// --focus=SESSION_ID`. This
 focuses the existing TUI, including its Kitty tab or pane, and dismisses the picker on
 success. It does not launch or resume a session. A loaded session can have no

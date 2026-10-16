@@ -6,18 +6,20 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use iced::Subscription;
 use iced::futures::channel::mpsc;
-use iced::futures::io::{AsyncBufReadExt, BufReader};
+use iced::futures::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use iced::futures::{SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Deserializer};
 
 use crate::fuzzy;
 use crate::module::{
-    ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, SearchResult, sort_results,
+    ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, ResultAction, SearchResult,
+    sort_results,
 };
 
 const MODULE_KEY: &str = "codex-sessions";
 const RESTART_DELAY: Duration = Duration::from_secs(3);
 const IDLE_SCORE_PENALTY: i64 = 1_000;
+const ACKNOWLEDGE_ACTION_ID: &str = "acknowledge";
 
 pub type FeedUpdate = Result<Vec<Session>, String>;
 
@@ -91,7 +93,15 @@ impl SessionStore {
                     subtitle: format!("Codex | {status} | {}", session.cwd),
                     icon_name: None,
                     kind: MatchKind::CodexSession,
-                    actions: Vec::new(),
+                    actions: if session.indicator() == SessionIndicator::Unread {
+                        vec![ResultAction {
+                            id: ACKNOWLEDGE_ACTION_ID,
+                            label: "Acknowledge",
+                            shortcut: 'a',
+                        }]
+                    } else {
+                        Vec::new()
+                    },
                     score,
                 })
             })
@@ -121,6 +131,15 @@ impl Module for CodexSessionsModule {
     }
 
     fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome> {
+        if action_id == ACKNOWLEDGE_ACTION_ID {
+            ensure!(
+                self.sessions.indicator(item_id) == Some(SessionIndicator::Unread),
+                "This Codex session is no longer waiting for acknowledgement"
+            );
+            acknowledge(item_id)?;
+            // The watch feed owns status updates; never clear unread optimistically.
+            return Ok(ActivationOutcome::RefreshResults);
+        }
         ensure!(
             action_id == DEFAULT_ACTION_ID,
             "Unknown Codex action: {action_id}"
@@ -165,6 +184,156 @@ fn focus_command(session_id: &str) -> Command {
     command.arg(format!("--focus={session_id}"));
     command.stdout(Stdio::null()).stderr(Stdio::piped());
     command
+}
+
+fn acknowledge(session_id: &str) -> Result<()> {
+    use iced::futures::future::{Either, select};
+
+    iced::futures::executor::block_on(async {
+        let mut command = Command::new("codex");
+        command.args(["app-server", "proxy"]);
+        let mut command = feed_command(command);
+        command.stdin(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .context("failed to start Codex acknowledgement proxy")?;
+        let io = ProxyIo {
+            input: child.stdin.take().context("missing proxy input")?,
+            output: child.stdout.take().context("missing proxy output")?,
+        };
+        let result = match select(
+            Box::pin(acknowledge_exchange(io, session_id)),
+            Box::pin(async_io::Timer::after(Duration::from_secs(10))),
+        )
+        .await
+        {
+            Either::Left((result, _)) => result,
+            Either::Right(_) => Err(anyhow::anyhow!(
+                "Timed out acknowledging Codex session; its status will update from the live feed"
+            )),
+        };
+        // This short-lived proxy must not outlive the action, even on protocol errors.
+        let _ = child.kill();
+        let _ = child.status().await;
+        result
+    })
+}
+
+// The proxy forwards raw socket bytes, including the WebSocket handshake and frames.
+struct ProxyIo {
+    input: async_process::ChildStdin,
+    output: async_process::ChildStdout,
+}
+
+impl AsyncRead for ProxyIo {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.output).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ProxyIo {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.input).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.input).poll_flush(cx)
+    }
+    fn poll_close(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.input).poll_close(cx)
+    }
+}
+
+async fn acknowledge_exchange<T: AsyncRead + AsyncWrite + Unpin>(
+    io: T,
+    session_id: &str,
+) -> Result<()> {
+    use async_tungstenite::{WebSocketStream, tungstenite::Message};
+    use serde_json::json;
+    let (mut socket, _) = async_tungstenite::client_async("ws://localhost/rpc", io)
+        .await
+        .context("Codex proxy WebSocket handshake failed")?;
+    async fn send<T: AsyncRead + AsyncWrite + Unpin>(
+        socket: &mut WebSocketStream<T>,
+        value: serde_json::Value,
+    ) -> Result<()> {
+        socket.send(Message::Text(value.to_string().into())).await?;
+        Ok(())
+    }
+    async fn response<T: AsyncRead + AsyncWrite + Unpin>(
+        socket: &mut WebSocketStream<T>,
+        id: u64,
+    ) -> Result<serde_json::Value> {
+        loop {
+            let frame = socket
+                .next()
+                .await
+                .context("Codex proxy closed before acknowledging the request")??;
+            let line = match frame {
+                Message::Text(line) => line,
+                Message::Ping(_) => {
+                    socket.flush().await?;
+                    continue;
+                }
+                Message::Close(_) => bail!("Codex proxy closed before acknowledging the request"),
+                _ => continue,
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&line).context("Invalid Codex proxy response")?;
+            if value.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
+                continue;
+            }
+            ensure!(
+                value.get("error").is_none(),
+                "Codex rejected the acknowledgement request"
+            );
+            return value
+                .get("result")
+                .cloned()
+                .context("Missing Codex response result");
+        }
+    }
+    send(
+        &mut socket,
+        json!({"id": 1, "method": "initialize", "params": {
+            "clientInfo": {"name": "picky", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {"experimentalApi": true}
+        }}),
+    )
+    .await?;
+    response(&mut socket, 1)
+        .await
+        .context("Could not initialize Codex acknowledgement connection")?;
+    send(&mut socket, json!({"method": "initialized"})).await?;
+    send(
+        &mut socket,
+        json!({"id": 2, "method": "thread/unread/set", "params": {
+            "threadId": session_id, "unread": false
+        }}),
+    )
+    .await?;
+    match response(&mut socket, 2)
+        .await?
+        .get("unread")
+        .and_then(serde_json::Value::as_bool)
+    {
+        Some(false) => Ok(()),
+        Some(true) => bail!("Codex did not acknowledge this session because it is active again"),
+        None => bail!("Codex did not return an acknowledgement state"),
+    }
 }
 
 pub fn subscription() -> Subscription<FeedUpdate> {
@@ -510,6 +679,106 @@ mod tests {
     }
 
     #[test]
+    fn acknowledgement_exchanges_only_initialize_and_unread_requests() {
+        let id = "opaque\"session";
+        let (result, requests) =
+            mock_acknowledgement(id, Some(json!({"id": 2, "result": {"unread": false}})));
+        result.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["method"], "initialize");
+        assert_eq!(requests[1]["method"], "initialized");
+        assert_eq!(requests[2]["method"], "thread/unread/set");
+        assert_eq!(
+            requests[2]["params"],
+            json!({"threadId": id, "unread": false})
+        );
+    }
+
+    #[test]
+    fn acknowledgement_rejects_active_errors_missing_state_and_disconnects() {
+        for reply in [
+            Some(json!({"id": 2, "result": {"unread": true}})),
+            Some(json!({"id": 2, "error": {"message": "rejected"}})),
+            Some(json!({"id": 2, "result": {}})),
+            None,
+        ] {
+            assert!(mock_acknowledgement("session", reply).0.is_err());
+        }
+    }
+
+    fn mock_acknowledgement(
+        id: &str,
+        reply: Option<serde_json::Value>,
+    ) -> (Result<()>, Vec<serde_json::Value>) {
+        use async_tungstenite::tungstenite::Message;
+        iced::futures::executor::block_on(async {
+            let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let client = async_io::Async::new(client).unwrap();
+            let server = async_io::Async::new(server).unwrap();
+            let server = async {
+                let mut socket = async_tungstenite::accept_async(server).await.unwrap();
+                let mut requests = Vec::new();
+                for index in 0..3 {
+                    let request = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                    requests.push(serde_json::from_str(&request).unwrap());
+                    if index == 0 {
+                        socket
+                            .send(Message::Text(
+                                json!({"id": 1, "result": {}}).to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                }
+                socket.send(Message::Ping(vec![1].into())).await.unwrap();
+                assert!(matches!(
+                    socket.next().await.unwrap().unwrap(),
+                    Message::Pong(_)
+                ));
+                socket
+                    .send(Message::Text(
+                        json!({"method": "thread/unread/changed"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if let Some(reply) = reply {
+                    socket
+                        .send(Message::Text(reply.to_string().into()))
+                        .await
+                        .unwrap();
+                } else {
+                    socket.close(None).await.unwrap();
+                }
+                requests
+            };
+            match iced::futures::future::select(
+                Box::pin(iced::futures::future::join(
+                    acknowledge_exchange(client, id),
+                    server,
+                )),
+                Box::pin(async_io::Timer::after(Duration::from_secs(3))),
+            )
+            .await
+            {
+                iced::futures::future::Either::Left((result, _)) => result,
+                _ => panic!("WebSocket acknowledgement stalled"),
+            }
+        })
+    }
+
+    #[test]
+    #[ignore = "requires the installed Codex proxy and running local server; sends an invalid ID without modifying a session"]
+    fn real_proxy_rejects_invalid_acknowledgement_without_timing_out() {
+        let error = acknowledge("picky-invalid-session-id").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Codex rejected the acknowledgement request"
+        );
+    }
+
+    #[test]
     fn ranks_unread_between_other_attention_and_working_and_updates_live() {
         let mut working = session("a-working");
         working["working"] = json!(true);
@@ -542,6 +811,10 @@ mod tests {
             );
             assert_eq!(store.indicator("d-input"), Some(SessionIndicator::Input));
             assert!(results[2].subtitle.contains("| Unread |"));
+            assert_eq!(results[2].actions[0].id, ACKNOWLEDGE_ACTION_ID);
+            assert!(results[0].actions.is_empty());
+            assert!(results[1].actions.is_empty());
+            assert!(results[3].actions.is_empty());
 
             let mut acknowledged = unread.clone();
             acknowledged["attention"] = json!([]);
@@ -554,6 +827,7 @@ mod tests {
             store.merge_results(query, &mut results);
             assert_eq!(results.last().unwrap().item_id, "b-unread");
             assert_eq!(store.indicator("b-unread"), Some(SessionIndicator::Idle));
+            assert!(results.last().unwrap().actions.is_empty());
         }
         store.replace(parse(vec![unread]));
         assert_eq!(store.search("unread").len(), 1);
