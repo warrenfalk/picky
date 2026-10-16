@@ -15,6 +15,7 @@ use crate::module::{
 };
 use crate::modules;
 use crate::modules::codex_sessions::{self, FeedUpdate, SessionIndicator, SessionStore};
+use crate::modules::mako_notifications::{self, NotificationStore};
 use crate::modules::niri_feed;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -106,6 +107,7 @@ enum Message {
     StartupFinished(StartupContext),
     IconIndexFinished(Arc<IconIndex>),
     CodexSessionsChanged(FeedUpdate),
+    NotificationsChanged(mako_notifications::FeedUpdate),
     SearchFinished {
         request_id: u64,
         result: Result<Vec<SearchResult>, String>,
@@ -130,6 +132,8 @@ pub struct PickerApp {
     registry: Option<Arc<Mutex<ModuleRegistry>>>,
     codex_sessions: SessionStore,
     codex_error: String,
+    notifications: NotificationStore,
+    notification_error: String,
     icon_index: Option<Arc<IconIndex>>,
     query: String,
     error_message: String,
@@ -276,6 +280,8 @@ fn initialize(server: Arc<ActivationServer>) -> (PickerApp, Task<Message>) {
     let startup_sessions = codex_sessions.clone();
     let niri = niri_feed::Store::default();
     let startup_niri = niri.clone();
+    let notifications = NotificationStore::default();
+    let startup_notifications = notifications.clone();
     let mut app = PickerApp {
         window_id: None,
         generation: 0,
@@ -288,6 +294,8 @@ fn initialize(server: Arc<ActivationServer>) -> (PickerApp, Task<Message>) {
         registry: None,
         codex_sessions,
         codex_error: String::new(),
+        notifications,
+        notification_error: String::new(),
         icon_index: None,
         query: String::new(),
         error_message: String::new(),
@@ -311,7 +319,9 @@ fn initialize(server: Arc<ActivationServer>) -> (PickerApp, Task<Message>) {
     let task = Task::batch([
         app.show(),
         Task::perform(
-            background(move || load_startup_context(startup_sessions, startup_niri)),
+            background(move || {
+                load_startup_context(startup_sessions, startup_niri, startup_notifications)
+            }),
             Message::StartupFinished,
         ),
     ]);
@@ -329,6 +339,7 @@ fn subscription(app: &PickerApp) -> Subscription<Message> {
         keyboard,
         event::listen_with(window_event_message),
         codex_sessions::subscription().map(Message::CodexSessionsChanged),
+        mako_notifications::subscription().map(Message::NotificationsChanged),
         niri_feed::subscription().map(Message::NiriChanged),
     ];
     if let Some(server) = &app.activation_server {
@@ -561,6 +572,26 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
                 Task::none()
             }
         }
+        Message::NotificationsChanged(update) => {
+            let notifications = match update {
+                Ok(notifications) => {
+                    app.notification_error.clear();
+                    notifications
+                }
+                Err(error) => {
+                    app.notification_error = error;
+                    Vec::new()
+                }
+            };
+            app.notifications.replace(notifications);
+            if app.window_id.is_some() {
+                let mut results = app.results.clone();
+                app.notifications.merge_results(&app.query, &mut results);
+                app.replace_live_results(results)
+            } else {
+                Task::none()
+            }
+        }
         Message::KeyPressed(key) => match app.focus_target {
             FocusTarget::Search => app.handle_search_key(key),
             FocusTarget::Results => app.handle_results_key(key),
@@ -576,6 +607,7 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
                 Ok(mut results) => {
                     // A live update may have arrived after this search began.
                     app.codex_sessions.merge_results(&app.query, &mut results);
+                    app.notifications.merge_results(&app.query, &mut results);
                     app.error_message.clear();
                     app.results = results;
                     app.results_row_bounds.clear();
@@ -761,6 +793,14 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
         content = content.push(view_status_banner(
             "Codex",
             app.codex_error.clone(),
+            BannerTone::Warning,
+        ));
+    }
+
+    if !app.notification_error.is_empty() {
+        content = content.push(view_status_banner(
+            "Notifications",
+            app.notification_error.clone(),
             BannerTone::Warning,
         ));
     }
@@ -2226,11 +2266,16 @@ fn theme_error() -> Color {
     color_from_hex(0xE18497)
 }
 
-fn load_startup_context(codex_sessions: SessionStore, niri: niri_feed::Store) -> StartupContext {
+fn load_startup_context(
+    codex_sessions: SessionStore,
+    niri: niri_feed::Store,
+    notifications: NotificationStore,
+) -> StartupContext {
     StartupContext {
         registry: Arc::new(Mutex::new(ModuleRegistry::new(modules::default_modules(
             codex_sessions,
             niri,
+            notifications,
         )))),
     }
 }
@@ -2254,6 +2299,8 @@ mod tests {
             registry: Some(Arc::new(Mutex::new(ModuleRegistry::new(Vec::new())))),
             codex_sessions: SessionStore::default(),
             codex_error: String::new(),
+            notifications: NotificationStore::default(),
+            notification_error: String::new(),
             icon_index: None,
             query: String::new(),
             error_message: String::new(),
@@ -2296,6 +2343,137 @@ mod tests {
             }))
             .unwrap(),
         ])
+    }
+
+    fn notification_update(id: u64, title: &str) -> mako_notifications::FeedUpdate {
+        Ok(vec![mako_notifications::Notification {
+            id,
+            app_name: "Mail".to_owned(),
+            summary: title.to_owned(),
+            body: String::new(),
+            icon_name: None,
+            urgency: 1,
+        }])
+    }
+
+    #[test]
+    fn live_notifications_preserve_selection_and_update_changed_or_removed_rows() {
+        let mut app = app_with_results(vec![result("Firefox", Vec::new())]);
+        app.focus_target = FocusTarget::Results;
+        let _ = update(
+            &mut app,
+            Message::NotificationsChanged(notification_update(42, "New mail")),
+        );
+        assert_eq!(app.results.len(), 2);
+        assert_eq!(app.selected_result().unwrap().title, "Firefox");
+
+        app.selected_index = Some(0);
+        let _ = update(
+            &mut app,
+            Message::NotificationsChanged(notification_update(42, "Updated mail")),
+        );
+        assert_eq!(app.selected_result().unwrap().item_id, "42");
+        assert_eq!(app.selected_result().unwrap().title, "Updated mail");
+        let _ = update(&mut app, Message::NotificationsChanged(Ok(Vec::new())));
+        assert_eq!(app.results.len(), 1);
+        assert_eq!(app.selected_result().unwrap().title, "Firefox");
+        assert_eq!(app.focus_target, FocusTarget::Results);
+        assert_eq!(
+            app.search_request_id, 0,
+            "live updates must not requery other modules"
+        );
+    }
+
+    #[test]
+    fn live_notifications_respect_the_current_query() {
+        let mut app = app_with_results(Vec::new());
+        app.query = "receipt".to_owned();
+        let _ = update(
+            &mut app,
+            Message::NotificationsChanged(notification_update(42, "New mail")),
+        );
+        assert!(app.results.is_empty());
+        let _ = update(
+            &mut app,
+            Message::NotificationsChanged(notification_update(42, "Your receipt")),
+        );
+        assert_eq!(app.results.len(), 1);
+        assert_eq!(app.query, "receipt");
+    }
+
+    #[test]
+    fn hidden_notifications_stay_warm_for_the_next_search() {
+        let mut app = app_with_results(Vec::new());
+        let _ = app.dismiss();
+        assert_eq!(
+            update(
+                &mut app,
+                Message::NotificationsChanged(notification_update(42, "While hidden"))
+            )
+            .units(),
+            0
+        );
+        assert!(app.window_id.is_none());
+        assert!(app.results.is_empty());
+        let mut results = Vec::new();
+        app.notifications.merge_results("", &mut results);
+        assert_eq!(results[0].title, "While hidden");
+    }
+
+    #[test]
+    fn search_completion_cannot_restore_stale_notifications() {
+        let mut app = app_with_results(Vec::new());
+        app.active_search_request_id = 1;
+        let _ = update(
+            &mut app,
+            Message::NotificationsChanged(notification_update(42, "Old")),
+        );
+        let stale = app.results.clone();
+        let _ = update(
+            &mut app,
+            Message::NotificationsChanged(notification_update(42, "Updated")),
+        );
+        let _ = update(
+            &mut app,
+            Message::SearchFinished {
+                request_id: 1,
+                result: Ok(stale.clone()),
+            },
+        );
+        assert_eq!(app.results[0].title, "Updated");
+        let _ = update(&mut app, Message::NotificationsChanged(Ok(Vec::new())));
+        let _ = update(
+            &mut app,
+            Message::SearchFinished {
+                request_id: 1,
+                result: Ok(stale),
+            },
+        );
+        assert!(app.results.is_empty());
+    }
+
+    #[test]
+    fn notification_disconnect_clears_only_notifications_and_recovers() {
+        let mut app = app_with_results(vec![result("Firefox", Vec::new())]);
+        let _ = update(
+            &mut app,
+            Message::NotificationsChanged(notification_update(42, "Old")),
+        );
+        let _ = update(
+            &mut app,
+            Message::NotificationsChanged(Err("Disconnected".to_owned())),
+        );
+        assert_eq!(app.results.len(), 1);
+        assert_eq!(app.results[0].title, "Firefox");
+        assert_eq!(app.notification_error, "Disconnected");
+        assert!(app.error_message.is_empty());
+        let _ = update(
+            &mut app,
+            Message::NotificationsChanged(notification_update(43, "New")),
+        );
+        assert_eq!(app.results.len(), 2);
+        assert_eq!(app.results[0].item_id, "43");
+        assert!(app.notification_error.is_empty());
     }
 
     #[test]

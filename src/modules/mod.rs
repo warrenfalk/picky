@@ -10,9 +10,12 @@ use crate::module::Module;
 pub fn default_modules(
     codex_sessions: codex_sessions::SessionStore,
     niri: niri_feed::Store,
+    notifications: mako_notifications::NotificationStore,
 ) -> Vec<Box<dyn Module>> {
     vec![
-        Box::new(mako_notifications::MakoNotificationsModule::new()),
+        Box::new(mako_notifications::MakoNotificationsModule::new(
+            notifications,
+        )),
         Box::new(codex_sessions::CodexSessionsModule::new(codex_sessions)),
         Box::new(applications::ApplicationsModule::new()),
         Box::new(niri_windows::NiriWindowsModule::with_store(niri.clone())),
