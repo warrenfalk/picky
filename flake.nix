@@ -148,6 +148,11 @@
 
           shellHook = ''
             ${graphicsRuntimeHook}
+            # Keep development residents local to this checkout and session.
+            picky_session="''${NIRI_SOCKET:-''${WAYLAND_DISPLAY:-default}}"
+            picky_session="''${picky_session##*/}"
+            export PICKY_SOCKET="''${PICKY_SOCKET:-$PWD/.direnv/picky-$picky_session.socket}"
+            unset picky_session
             export PS1="(picky) ''${PS1:-\\u@\\h:\\w \\$ }"
           '';
         };
