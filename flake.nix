@@ -5,6 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay.url = "github:oxalica/rust-overlay";
+    crane.url = "git+https://github.com/ipetkov/crane?shallow=1";
   };
 
   outputs =
@@ -13,6 +14,7 @@
       nixpkgs,
       flake-utils,
       rust-overlay,
+      crane,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -68,16 +70,17 @@
             "rustfmt"
           ];
         };
-        rustPlatform = pkgs.makeRustPlatform {
-          cargo = rustToolchain;
-          rustc = rustToolchain;
-        };
-        package = rustPlatform.buildRustPackage {
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+        # Keep all compilation settings here so both stages use identical inputs.
+        # See BUILDING.md before adding stage-specific Cargo flags or build hooks.
+        commonArgs = {
           pname = "picky";
           version = "0.1.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
+          src = craneLib.cleanCargoSource ./.;
+          cargoExtraArgs = "--locked";
+          CARGO_PROFILE = "release";
           nativeBuildInputs = with pkgs; [
+            jq
             makeWrapper
             pkg-config
             wrapGAppsHook4
@@ -88,23 +91,37 @@
               gtk4
             ]
             ++ runtimeLibs;
-          postFixup = ''
-            for bin in picky wgpu_probe; do
-              wrapped="$out/bin/.''${bin}-wrapped"
-              [ -x "$wrapped" ] || continue
-
-              printf '%s\n' \
-                '#!${pkgs.runtimeShell}' \
-                'set -eu' \
-                '. ${graphicsRuntimeScript}' \
-                "export PATH=\"${runtimeBinPath}:\$PATH\"" \
-                "exec \"$wrapped\" \"\$@\"" \
-                > "$out/bin/''${bin}"
-
-              chmod +x "$out/bin/''${bin}"
-            done
-          '';
         };
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        package = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+            # Cargo reports whether each artifact was reused. Check the outcome,
+            # including settings introduced by hooks, rather than a list of flags.
+            postBuild = ''
+              cargo metadata --format-version 1 --no-deps --offline > cargo-metadata.json
+              jq --exit-status --slurp --slurpfile metadata cargo-metadata.json \
+                --from-file ${./nix/check-cargo-reuse.jq} "$cargoBuildLog"
+            '';
+            postFixup = ''
+              for bin in picky wgpu_probe; do
+                wrapped="$out/bin/.''${bin}-wrapped"
+                [ -x "$wrapped" ] || continue
+
+                printf '%s\n' \
+                  '#!${pkgs.runtimeShell}' \
+                  'set -eu' \
+                  '. ${graphicsRuntimeScript}' \
+                  "export PATH=\"${runtimeBinPath}:\$PATH\"" \
+                  "exec \"$wrapped\" \"\$@\"" \
+                  > "$out/bin/''${bin}"
+
+                chmod +x "$out/bin/''${bin}"
+              done
+            '';
+          }
+        );
       in
       {
         packages.default = package;
@@ -114,6 +131,7 @@
         };
 
         checks.default = package;
+        checks.cargo-reuse = import ./nix/check-cargo-reuse.nix { inherit pkgs; };
 
         devShells.default = pkgs.mkShell {
           name = "picky";

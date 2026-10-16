@@ -17,6 +17,7 @@ Read `iced-best-practices/iced-best-practices.md` and follow the guidelines ther
 - `cargo test`: run unit tests.
 - `cargo run --bin wgpu_probe`: inspect `wgpu` adapter/backend detection.
 - `nix build`: build the packaged application and launcher wrapper.
+- `nix flake check`: build/test the package and check the Cargo artifact reuse guard.
 - `nix fmt flake.nix`: format Nix files with `nixfmt-rfc-style`.
 
 ## Coding Style & Naming Conventions
@@ -34,3 +35,5 @@ Recent history favors short, imperative commit messages such as `fix install`, `
 ## Environment & Configuration Notes
 
 This project depends on Nix packaging and graphics runtime behavior. If rendering differs between `cargo run` and installed builds, verify the `wgpu` backend first with `src/bin/wgpu_probe.rs` before changing UI code.
+
+Read `BUILDING.md` before changing Rust packaging. Both Crane stages must use the shared `commonArgs` and toolchain in `flake.nix`; put compilation flags, features, profiles, native inputs, and compilation environment there. The final build rejects recompiled external dependencies through `nix/check-cargo-reuse.jq`. Keep application-only installation/wrapping hooks in the final stage.
