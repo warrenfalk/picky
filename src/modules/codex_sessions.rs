@@ -156,6 +156,20 @@ impl Module for CodexSessionsModule {
                 Ok(())
             });
         if let Err(focus_error) = focus {
+            // A first GUI launch stays running; do not wait for the app to close.
+            // Spawning also checks PATH availability without a separate lookup.
+            let mut gui = Command::new("codex-gui");
+            gui.args(["resume", item_id])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            detach_session(&mut gui);
+            if let Ok(mut child) = gui.spawn() {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(ActivationOutcome::ClosePicker);
+            }
             let output = Command::new("xdg-open")
                 .arg(format!("https://agent.warrenfalk.com/#{item_id}"))
                 .stdin(Stdio::null())
@@ -168,6 +182,20 @@ impl Module for CodexSessionsModule {
             );
         }
         Ok(ActivationOutcome::ClosePicker)
+    }
+}
+
+fn detach_session(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: setsid is async-signal-safe; the hook does not allocate or lock.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 }
 
@@ -976,6 +1004,23 @@ mod tests {
                 .to_string()
                 .contains("disconnected")
         );
+    }
+
+    #[test]
+    fn detached_app_has_its_own_session_and_process_group() {
+        // Desktop apps must not receive signals sent to Picky's process group
+        // or controlling terminal when the picker is terminated.
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        detach_session(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: these calls only query the live child's process identifiers.
+        let (session, group) = unsafe { (libc::getsid(pid), libc::getpgid(pid)) };
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(session, pid);
+        assert_eq!(group, pid);
     }
 
     #[test]
