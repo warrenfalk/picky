@@ -1,13 +1,13 @@
 //! One persistent Niri connection shared by the window and workspace indexes.
 use std::collections::BTreeMap;
-use std::process::Stdio;
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use iced::Subscription;
 use iced::futures::channel::mpsc;
-use iced::futures::io::{AsyncBufReadExt, BufReader};
+use iced::futures::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use iced::futures::{SinkExt, Stream, StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -177,19 +177,30 @@ fn watch() -> impl Stream<Item = Update> {
 }
 
 async fn forward(output: &mut mpsc::Sender<Update>) -> Result<()> {
-    let mut command = std::process::Command::new("niri");
-    command.args(["msg", "--json", "event-stream"]);
-    super::codex_sessions::stop_with_parent(&mut command);
-    let mut command = async_process::Command::from(command);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .context("could not start Niri event stream")?;
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let path = std::env::var_os("NIRI_SOCKET").context("NIRI_SOCKET is not set")?;
+    let socket = async_io::Async::<UnixStream>::connect(path)
+        .await
+        .context("could not connect to Niri event stream")?;
+    forward_events(socket, output).await
+}
+
+async fn forward_events(
+    mut socket: impl AsyncRead + AsyncWrite + Unpin,
+    output: &mut mpsc::Sender<Update>,
+) -> Result<()> {
+    socket.write_all(b"\"EventStream\"\n").await?;
+    let mut lines = BufReader::new(socket).lines();
+    let reply = lines
+        .next()
+        .await
+        .context("Niri event stream disconnected before reply")??;
+    let reply: Value = serde_json::from_str(&reply).context("invalid Niri event stream reply")?;
+    if reply != serde_json::json!({"Ok": "Handled"}) {
+        bail!("Niri rejected event stream request: {reply}");
+    }
+
+    // The CLI decodes a fixed Event enum and exits on events added by a newer
+    // compositor. Read raw JSON instead; Store::apply ignores unrelated events.
     while let Some(line) = lines.next().await {
         output.send(Ok(serde_json::from_str(&line?)?)).await?;
     }
@@ -213,6 +224,75 @@ pub fn ticks() -> Subscription<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn event_stream_survives_unknown_events_and_keeps_updating_windows() {
+        async_io::block_on(async {
+            let (client, server) = UnixStream::pair().unwrap();
+            let client = async_io::Async::new(client).unwrap();
+            let server = async_io::Async::new(server).unwrap();
+            let (mut output, mut updates) = mpsc::channel(8);
+            let events = [
+                json!({"WindowsChanged": {"windows": [{"id": 1, "title": "Old"}]}}),
+                json!({"TouchpadToggled": {"on": true}}),
+                json!({"FutureEvent": {"value": 42}}),
+                json!({"WindowOpenedOrChanged": {"window": {"id": 1, "title": "New"}}}),
+                json!({"WindowClosed": {"id": 1}}),
+            ];
+            let serve = async {
+                let mut server = BufReader::new(server);
+                let mut request = String::new();
+                server.read_line(&mut request).await.unwrap();
+                assert_eq!(request, "\"EventStream\"\n");
+                server
+                    .get_mut()
+                    .write_all(b"{\"Ok\":\"Handled\"}\n")
+                    .await
+                    .unwrap();
+                for event in &events {
+                    let line = format!("{event}\n");
+                    server.get_mut().write_all(line.as_bytes()).await.unwrap();
+                }
+            };
+            let (result, ()) = iced::futures::join!(forward_events(client, &mut output), serve);
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "Niri event stream disconnected"
+            );
+            drop(output);
+            let store = Store::default();
+            for (index, event) in events.iter().enumerate() {
+                let update = updates.next().await.unwrap().unwrap();
+                assert_eq!(&update, event);
+                assert_eq!(store.apply(Ok(update)), !matches!(index, 1 | 2));
+                if index == 3 {
+                    assert_eq!(
+                        store.windows::<Value>().unwrap().unwrap()[0]["title"],
+                        "New"
+                    );
+                }
+            }
+            assert!(store.windows::<Value>().unwrap().unwrap().is_empty());
+            assert!(updates.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn event_stream_rejects_failed_handshake() {
+        async_io::block_on(async {
+            let (client, server) = UnixStream::pair().unwrap();
+            let client = async_io::Async::new(client).unwrap();
+            let mut server = async_io::Async::new(server).unwrap();
+            let (mut output, mut updates) = mpsc::channel(1);
+            let serve = async {
+                server.write_all(b"{\"Err\":\"denied\"}\n").await.unwrap();
+            };
+            let (result, ()) = iced::futures::join!(forward_events(client, &mut output), serve);
+            assert!(result.unwrap_err().to_string().contains("denied"));
+            drop(output);
+            assert!(updates.next().await.is_none());
+        });
+    }
 
     #[test]
     fn snapshots_replace_state_and_reconnection_cannot_retain_closed_windows() {
