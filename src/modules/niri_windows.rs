@@ -9,9 +9,10 @@ use serde::Deserialize;
 use crate::fuzzy;
 use crate::fuzzy::WeightedField;
 use crate::module::{
-    ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, ResultAction, SearchResult,
+    ActivationOutcome, DEFAULT_ACTION_ID, LaunchWorkspace, MatchKind, Module, ResultAction,
+    SearchResult, WindowMatch, sort_results,
 };
-use crate::modules::applications::{ApplicationMetadata, ApplicationStore};
+use crate::modules::applications::{ApplicationMetadata, ApplicationStore, application_match};
 
 const MODULE_KEY: &str = "niri-windows";
 const CLOSE_ACTION_ID: &str = "close";
@@ -35,6 +36,8 @@ struct NiriWindow {
     app_id: String,
     pid: Option<u32>,
     workspace_id: u64,
+    #[serde(default)]
+    focus_timestamp: Option<Duration>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -43,8 +46,6 @@ struct NiriWorkspace {
     idx: u64,
     name: Option<String>,
     output: String,
-    #[serde(default)]
-    is_focused: bool,
 }
 
 trait WindowsBackend: Send {
@@ -189,6 +190,7 @@ impl Module for NiriWindowsModule {
 
         let mut results = windows
             .into_iter()
+            .filter(|window| !(window.app_id == "picky" && window.pid == Some(std::process::id())))
             .filter_map(|window| {
                 let workspace = workspaces.get(&window.workspace_id);
                 let workspace_label = workspace
@@ -211,6 +213,7 @@ impl Module for NiriWindowsModule {
                     &workspace_label,
                     output_name,
                 )?;
+                let title_score = fuzzy::score_fields(query, &[(&window.title, 110)]);
 
                 let subtitle = if application_label.is_empty() {
                     format!("{workspace_label} on {output_name}")
@@ -218,50 +221,60 @@ impl Module for NiriWindowsModule {
                     format!("{application_label}  {workspace_label} on {output_name}")
                 };
 
-                Some((
-                    SearchResult {
-                        module_key: MODULE_KEY,
-                        item_id: encode_window_target(window.id, window.pid),
-                        title: window.title,
-                        subtitle,
-                        icon_name: icon_name_for_app_id(&applications.metadata, &window.app_id),
-                        kind: MatchKind::Window,
-                        actions: vec![
-                            ResultAction {
-                                id: CLOSE_ACTION_ID,
-                                label: "close",
-                                shortcut: 'q',
-                            },
-                            ResultAction {
-                                id: TERMINATE_ACTION_ID,
-                                label: "terminate",
-                                shortcut: 't',
-                            },
-                            ResultAction {
-                                id: KILL_ACTION_ID,
-                                label: "kill",
-                                shortcut: 'k',
-                            },
-                        ],
-                        score,
-                    },
-                    workspace.is_some_and(|workspace| workspace.is_focused),
-                ))
+                Some(SearchResult {
+                    module_key: MODULE_KEY,
+                    item_id: encode_window_target(window.id, window.pid),
+                    title: window.title,
+                    subtitle,
+                    icon_name: icon_name_for_app_id(&applications.metadata, &window.app_id),
+                    kind: MatchKind::Window,
+                    actions: vec![
+                        ResultAction {
+                            id: CLOSE_ACTION_ID,
+                            label: "close",
+                            shortcut: 'q',
+                        },
+                        ResultAction {
+                            id: TERMINATE_ACTION_ID,
+                            label: "terminate",
+                            shortcut: 't',
+                        },
+                        ResultAction {
+                            id: KILL_ACTION_ID,
+                            label: "kill",
+                            shortcut: 'k',
+                        },
+                    ],
+                    score,
+                    application: application_for_app_id(&applications.metadata, &window.app_id)
+                        .map(|application| {
+                            application_match(query, &application.name, &application.desktop_id)
+                        }),
+                    window: Some(WindowMatch {
+                        workspace_id: window.workspace_id,
+                        focus_timestamp: window.focus_timestamp,
+                        title_score,
+                    }),
+                })
             })
             .collect::<Vec<_>>();
 
-        results.sort_by(|(left, left_focused), (right, right_focused)| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| right_focused.cmp(left_focused))
-                .then_with(|| left.title.cmp(&right.title))
-        });
+        sort_results(
+            &mut results,
+            self.store
+                .as_ref()
+                .and_then(|store| store.picker_workspace_id()),
+        );
 
-        Ok(results.into_iter().map(|(result, _)| result).collect())
+        Ok(results)
     }
 
-    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome> {
+    fn activate(
+        &mut self,
+        item_id: &str,
+        action_id: &str,
+        _workspace: Option<&LaunchWorkspace>,
+    ) -> Result<ActivationOutcome> {
         let target = parse_window_target(item_id)?;
 
         match action_id {
@@ -441,6 +454,22 @@ fn load_windows() -> Result<Vec<NiriWindow>> {
     serde_json::from_slice(&output.stdout).context("failed to parse niri windows JSON")
 }
 
+pub fn picker_workspace() -> Result<Option<LaunchWorkspace>> {
+    let Some(window) = load_windows()?
+        .into_iter()
+        .find(|window| window.app_id == "picky" && window.pid == Some(std::process::id()))
+    else {
+        return Ok(None);
+    };
+    Ok(load_workspaces()?
+        .into_iter()
+        .find(|workspace| workspace.id == window.workspace_id)
+        .map(|workspace| LaunchWorkspace {
+            id: workspace.id,
+            name: workspace.name,
+        }))
+}
+
 fn load_workspaces() -> Result<Vec<NiriWorkspace>> {
     let output = Command::new("niri")
         .args(["msg", "--json", "workspaces"])
@@ -537,6 +566,7 @@ mod tests {
             app_id: app_id.to_string(),
             pid,
             workspace_id,
+            focus_timestamp: None,
         }
     }
 
@@ -546,19 +576,12 @@ mod tests {
             idx,
             name: name.map(ToOwned::to_owned),
             output: output.to_string(),
-            is_focused: false,
-        }
-    }
-
-    fn focused_workspace(id: u64, idx: u64, name: Option<&str>, output: &str) -> NiriWorkspace {
-        NiriWorkspace {
-            is_focused: true,
-            ..workspace(id, idx, name, output)
         }
     }
 
     fn application(name: &str) -> ApplicationMetadata {
         ApplicationMetadata {
+            desktop_id: format!("{}.desktop", name.to_lowercase()),
             name: name.to_string(),
             icon_name: None,
         }
@@ -672,6 +695,7 @@ mod tests {
         let updated = ApplicationStore::with_metadata(HashMap::from([(
             "browser".to_owned(),
             ApplicationMetadata {
+                desktop_id: "browser.desktop".to_owned(),
                 name: "New browser".to_owned(),
                 icon_name: Some("new-icon".to_owned()),
             },
@@ -684,14 +708,14 @@ mod tests {
     }
 
     #[test]
-    fn search_prefers_focused_workspace_when_matches_are_otherwise_equal() {
+    fn shared_sort_prefers_picker_workspace_when_matches_are_otherwise_equal() {
         let state = Arc::new(Mutex::new(FakeState {
             windows: vec![
                 window(1, "Project notes", "firefox", Some(111), 10),
                 window(2, "Project notes", "firefox", Some(222), 20),
             ],
             workspaces: vec![
-                focused_workspace(10, 2, Some("code"), "DP-1"),
+                workspace(10, 2, Some("code"), "DP-1"),
                 workspace(20, 3, Some("chat"), "DP-2"),
             ],
             ..FakeState::default()
@@ -701,7 +725,8 @@ mod tests {
             Box::new(FakeWindowsBackend { state }),
         );
 
-        let results = module.search("firefox").unwrap();
+        let mut results = module.search("firefox").unwrap();
+        sort_results(&mut results, Some(10));
 
         assert_eq!(results[0].item_id, "1:111");
         assert_eq!(results[1].item_id, "2:222");
@@ -709,14 +734,14 @@ mod tests {
     }
 
     #[test]
-    fn search_keeps_better_match_above_focused_workspace_bonus() {
+    fn search_keeps_better_title_match_above_workspace_preference() {
         let state = Arc::new(Mutex::new(FakeState {
             windows: vec![
                 window(1, "Firefox docs", "wezterm", Some(111), 10),
                 window(2, "Firefox", "wezterm", Some(222), 20),
             ],
             workspaces: vec![
-                focused_workspace(10, 2, Some("code"), "DP-1"),
+                workspace(10, 2, Some("code"), "DP-1"),
                 workspace(20, 3, Some("chat"), "DP-2"),
             ],
             ..FakeState::default()
@@ -726,7 +751,8 @@ mod tests {
             Box::new(FakeWindowsBackend { state }),
         );
 
-        let results = module.search("firefox").unwrap();
+        let mut results = module.search("firefox").unwrap();
+        sort_results(&mut results, Some(10));
 
         assert_eq!(results[0].item_id, "2:222");
         assert_eq!(results[1].item_id, "1:111");
@@ -743,7 +769,7 @@ mod tests {
             }),
         );
 
-        let outcome = module.activate("42", DEFAULT_ACTION_ID).unwrap();
+        let outcome = module.activate("42", DEFAULT_ACTION_ID, None).unwrap();
 
         assert_eq!(outcome, ActivationOutcome::ClosePicker);
         assert_eq!(state.lock().unwrap().focused.as_slice(), ["42"]);
@@ -762,7 +788,7 @@ mod tests {
             }),
         );
 
-        let outcome = module.activate("42", CLOSE_ACTION_ID).unwrap();
+        let outcome = module.activate("42", CLOSE_ACTION_ID, None).unwrap();
 
         assert_eq!(outcome, ActivationOutcome::RefreshResults);
         let state = state.lock().unwrap();
@@ -786,7 +812,7 @@ mod tests {
             }),
         );
 
-        let outcome = module.activate("42", CLOSE_ACTION_ID).unwrap();
+        let outcome = module.activate("42", CLOSE_ACTION_ID, None).unwrap();
 
         assert_eq!(outcome, ActivationOutcome::ClosePicker);
         assert_eq!(state.lock().unwrap().focused.as_slice(), ["42"]);
@@ -802,8 +828,8 @@ mod tests {
             }),
         );
 
-        module.activate("42:99", TERMINATE_ACTION_ID).unwrap();
-        module.activate("42:99", KILL_ACTION_ID).unwrap();
+        module.activate("42:99", TERMINATE_ACTION_ID, None).unwrap();
+        module.activate("42:99", KILL_ACTION_ID, None).unwrap();
 
         assert_eq!(
             state.lock().unwrap().signaled.as_slice(),

@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use crate::launcher::{self, ActivationServer};
 use crate::module::{
-    ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, ModuleRegistry, ResultAction, SearchResult,
+    ActivationOutcome, DEFAULT_ACTION_ID, LAUNCH_ACTION_ID, LaunchWorkspace, MatchKind,
+    ModuleRegistry, ResultAction, SearchResult, sort_results,
 };
 use crate::modules;
 use crate::modules::applications::{self, ApplicationCatalog, ApplicationStore};
@@ -432,20 +433,27 @@ fn results_event_message(
     results_key_message(key, modifiers)
 }
 
-fn search_key_message(key: Key, _modifiers: keyboard::Modifiers) -> Option<Message> {
+fn search_key_message(key: Key, modifiers: keyboard::Modifiers) -> Option<Message> {
     match key {
         Key::Named(Named::ArrowDown) => Some(Message::KeyPressed(AppKey::Down)),
         Key::Named(Named::Tab) => Some(Message::KeyPressed(AppKey::Tab)),
         Key::Named(Named::Escape) => Some(Message::KeyPressed(AppKey::Escape)),
+        Key::Named(Named::Enter) if modifiers.shift() => {
+            Some(Message::ActivateSelectedAction(LAUNCH_ACTION_ID))
+        }
+        Key::Named(Named::Enter) => Some(Message::ActivateSelected),
         _ => None,
     }
 }
 
-fn results_key_message(key: Key, _modifiers: keyboard::Modifiers) -> Option<Message> {
+fn results_key_message(key: Key, modifiers: keyboard::Modifiers) -> Option<Message> {
     match key {
         Key::Named(Named::ArrowDown) => Some(Message::KeyPressed(AppKey::Down)),
         Key::Named(Named::ArrowUp) => Some(Message::KeyPressed(AppKey::Up)),
         Key::Named(Named::Tab) => Some(Message::KeyPressed(AppKey::Tab)),
+        Key::Named(Named::Enter) if modifiers.shift() => {
+            Some(Message::ActivateSelectedAction(LAUNCH_ACTION_ID))
+        }
         Key::Named(Named::Enter) => Some(Message::KeyPressed(AppKey::Enter)),
         Key::Named(Named::Escape) => Some(Message::KeyPressed(AppKey::Escape)),
         Key::Character(value) if value == "/" => Some(Message::KeyPressed(AppKey::FocusSearch)),
@@ -707,6 +715,7 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
                     // A live update may have arrived after this search began.
                     app.codex_sessions.merge_results(&app.query, &mut results);
                     app.notifications.merge_results(&app.query, &mut results);
+                    sort_results(&mut results, app.niri.picker_workspace_id());
                     app.error_message.clear();
                     app.results = results;
                     app.results_row_bounds.clear();
@@ -788,10 +797,10 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
 }
 
 fn view(app: &PickerApp) -> Element<'_, Message> {
+    // The keyboard subscription handles Enter so Shift+Enter cannot also submit.
     let search = text_input("Type to search", &app.query)
         .id(app.search_input_id.clone())
         .on_input(Message::QueryChanged)
-        .on_submit(Message::ActivateSelected)
         .padding([14, 16])
         .size(22)
         .style(search_input_style);
@@ -861,9 +870,24 @@ fn view(app: &PickerApp) -> Element<'_, Message> {
 
     let mut content = column![
         search_panel,
-        text(format!("{} results", app.results.len()))
+        row![
+            text(format!("{} results", app.results.len()))
+                .size(14)
+                .color(theme_secondary_text()),
+            iced::widget::space().width(Length::Fill),
+            text(
+                if app
+                    .selected_result()
+                    .is_some_and(|result| result.application.is_some())
+                {
+                    "Shift+Enter: launch application"
+                } else {
+                    ""
+                }
+            )
             .size(14)
             .color(theme_secondary_text()),
+        ],
         container(
             scrollable(results_list)
                 .id(app.results_scroll_id.clone())
@@ -1349,7 +1373,6 @@ impl PickerApp {
         let mut results = self.results.clone();
         results.retain(|result| !keys.contains(&result.module_key));
         results.extend(replacement);
-        crate::module::sort_results(&mut results);
         self.replace_live_results(results)
     }
 
@@ -1359,7 +1382,8 @@ impl PickerApp {
         self.replace_live_results(results)
     }
 
-    fn replace_live_results(&mut self, results: Vec<SearchResult>) -> Task<Message> {
+    fn replace_live_results(&mut self, mut results: Vec<SearchResult>) -> Task<Message> {
+        sort_results(&mut results, self.niri.picker_workspace_id());
         if results == self.results {
             return Task::none();
         }
@@ -1517,13 +1541,17 @@ impl PickerApp {
         let Some(registry) = self.registry.as_ref().map(Arc::clone) else {
             return Task::none();
         };
-        let key = (result.module_key, result.item_id.clone(), action_id);
+        let Some((module_key, item_id, target_action_id)) = result.action_target(action_id) else {
+            return Task::none();
+        };
+        let key = (module_key, item_id.to_owned(), target_action_id);
         if !self.pending_actions.insert(key.clone()) {
             return Task::none();
         }
 
+        let workspace = self.niri.picker_workspace();
         Task::perform(
-            background(move || activate_result(registry, result, action_id)),
+            background(move || activate_result(registry, result, action_id, workspace)),
             {
                 let generation = self.generation;
                 move |result| Message::ActionSettled {
@@ -1541,8 +1569,12 @@ impl PickerApp {
     }
 
     fn action_is_pending(&self, result: &SearchResult, action_id: &'static str) -> bool {
-        self.pending_actions
-            .contains(&(result.module_key, result.item_id.clone(), action_id))
+        result
+            .action_target(action_id)
+            .is_some_and(|(module_key, item_id, action_id)| {
+                self.pending_actions
+                    .contains(&(module_key, item_id.to_owned(), action_id))
+            })
     }
 
     fn handle_search_key(&mut self, key: AppKey) -> Task<Message> {
@@ -1731,17 +1763,27 @@ fn activate_result(
     registry: Arc<Mutex<ModuleRegistry>>,
     result: SearchResult,
     action_id: &'static str,
+    mut workspace: Option<LaunchWorkspace>,
 ) -> Result<ActivationOutcome, String> {
+    if result
+        .action_target(action_id)
+        .is_some_and(|(key, _, _)| key == "applications")
+        && workspace.is_none()
+        && env::var_os("NIRI_SOCKET").is_some()
+    {
+        workspace = modules::niri_windows::picker_workspace()
+            .map_err(|error| format!("could not resolve Picky's workspace: {error:#}"))?;
+        if workspace.is_none() {
+            return Err("Picky's workspace is not available yet; try launching again".to_owned());
+        }
+    }
     let mut registry = registry
         .lock()
         .map_err(|_| "module registry lock poisoned".to_string())?;
 
-    if action_id == DEFAULT_ACTION_ID {
-        registry.activate(&result)
-    } else {
-        registry.activate_action(&result, action_id)
-    }
-    .map_err(|error| error.to_string())
+    registry
+        .activate_action(&result, action_id, workspace.as_ref())
+        .map_err(|error| error.to_string())
 }
 
 fn window_id_for_result(result: &SearchResult) -> Option<u64> {
@@ -2500,6 +2542,8 @@ mod tests {
             kind: MatchKind::Application,
             actions,
             score: 1,
+            application: None,
+            window: None,
         }
     }
 
@@ -2782,6 +2826,8 @@ mod tests {
             kind: MatchKind::Window,
             actions: Vec::new(),
             score: 1,
+            application: None,
+            window: None,
         }
     }
 
@@ -3283,6 +3329,109 @@ mod tests {
 
         assert_eq!(app.selected_action_id_for_shortcut('q'), Some("close"));
         assert_eq!(app.selected_action_id_for_shortcut('Q'), Some("close"));
+    }
+
+    #[test]
+    fn shift_enter_launches_window_application_from_search_or_results_and_deduplicates_launches() {
+        use crate::module::ApplicationMatch;
+
+        for key_message in [search_key_message, results_key_message] {
+            let mut window = window_result("42:123");
+            window.application = Some(ApplicationMatch {
+                desktop_id: "firefox.desktop".to_owned(),
+                score: Some(290),
+            });
+            let mut app = app_with_results(vec![window]);
+            let message =
+                key_message(Key::Named(Named::Enter), keyboard::Modifiers::SHIFT).unwrap();
+            assert!(matches!(
+                message,
+                Message::ActivateSelectedAction(LAUNCH_ACTION_ID)
+            ));
+            assert_eq!(update(&mut app, message).units(), 1);
+            assert!(app.pending_actions.contains(&(
+                "applications",
+                "firefox.desktop".to_owned(),
+                DEFAULT_ACTION_ID
+            )));
+
+            let mut launch = result("Launch Firefox", Vec::new());
+            launch.module_key = "applications";
+            launch.item_id = "firefox.desktop".to_owned();
+            app.results.push(launch);
+            app.selected_index = Some(1);
+            assert_eq!(app.activate_selected(DEFAULT_ACTION_ID).units(), 0);
+        }
+    }
+
+    #[test]
+    fn shift_enter_does_nothing_without_an_associated_application() {
+        let mut app = app_with_results(vec![window_result("42")]);
+        let message =
+            search_key_message(Key::Named(Named::Enter), keyboard::Modifiers::SHIFT).unwrap();
+        assert_eq!(update(&mut app, message).units(), 0);
+        assert!(app.pending_actions.is_empty());
+        assert!(matches!(
+            search_key_message(Key::Named(Named::Enter), keyboard::Modifiers::empty()),
+            Some(Message::ActivateSelected)
+        ));
+        assert!(matches!(
+            results_key_message(Key::Named(Named::Enter), keyboard::Modifiers::empty()),
+            Some(Message::KeyPressed(AppKey::Enter))
+        ));
+    }
+
+    #[test]
+    fn initial_results_and_live_merges_preserve_workspace_ranking_and_selection() {
+        use crate::module::{ApplicationMatch, WindowMatch};
+
+        let mut local = window_result("42:123");
+        local.application = Some(ApplicationMatch {
+            desktop_id: "firefox.desktop".to_owned(),
+            score: Some(290),
+        });
+        local.window = Some(WindowMatch {
+            workspace_id: 10,
+            focus_timestamp: Some(Duration::from_secs(1)),
+            title_score: None,
+        });
+        let mut remote = local.clone();
+        remote.item_id = "43:124".to_owned();
+        remote.window.as_mut().unwrap().workspace_id = 20;
+        let mut launch = result("Launch Firefox", Vec::new());
+        launch.module_key = "applications";
+        launch.item_id = "firefox.desktop".to_owned();
+        launch.application = local.application.clone();
+        let mut app = app_with_results(vec![launch, remote.clone(), local.clone()]);
+        app.niri.apply(Ok(json!({"WindowsChanged": {"windows": [{
+            "id": 99, "app_id": "picky", "pid": std::process::id(), "workspace_id": 10
+        }]}})));
+        let initial = app.results.clone();
+        let request_id = app.active_search_request_id;
+        let _ = update(
+            &mut app,
+            Message::SearchFinished {
+                request_id,
+                result: Ok(initial),
+            },
+        );
+        assert_eq!(app.results[0].item_id, "42:123");
+        app.focus_target = FocusTarget::Results;
+        app.selected_index = Some(2);
+        let _ = app.merge_live_results(&["niri-windows"], vec![remote, local]);
+        assert_eq!(
+            app.results
+                .iter()
+                .map(|result| result.item_id.as_str())
+                .collect::<Vec<_>>(),
+            ["42:123", "firefox.desktop", "43:124"]
+        );
+        assert_eq!(app.selected_result().unwrap().item_id, "43:124");
+
+        // Other feeds also sort the whole list; their refresh must retain locality.
+        let _ = app.refresh_codex_results();
+        assert_eq!(app.results[0].item_id, "42:123");
+        assert_eq!(app.selected_result().unwrap().item_id, "43:124");
     }
 
     #[test]

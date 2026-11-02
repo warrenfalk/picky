@@ -12,6 +12,8 @@ use iced::futures::{SinkExt, Stream, StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::module::LaunchWorkspace;
+
 pub type Update = Result<Value, String>;
 
 #[derive(Clone, Default, Debug)]
@@ -23,6 +25,7 @@ struct State {
     workspaces: BTreeMap<u64, Value>,
     has_windows: bool,
     has_workspaces: bool,
+    picker_window: Option<(u64, u64)>,
 }
 
 impl Store {
@@ -34,6 +37,27 @@ impl Store {
     pub fn workspaces<T: DeserializeOwned>(&self) -> Option<Result<Vec<T>>> {
         let state = self.0.lock().unwrap();
         state.has_workspaces.then(|| decode(&state.workspaces))
+    }
+
+    pub fn picker_workspace_id(&self) -> Option<u64> {
+        self.0
+            .lock()
+            .unwrap()
+            .picker_window
+            .map(|(_, workspace_id)| workspace_id)
+    }
+
+    pub fn picker_workspace(&self) -> Option<LaunchWorkspace> {
+        let state = self.0.lock().unwrap();
+        let (_, id) = state.picker_window?;
+        let workspace = state.workspaces.get(&id)?;
+        Some(LaunchWorkspace {
+            id,
+            name: workspace
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
     }
 
     /// Returns whether searchable data changed. Layout-only window events are ignored.
@@ -48,17 +72,25 @@ impl Store {
             .pointer("/WindowsChanged/windows")
             .and_then(Value::as_array)
         {
+            let picker_window = windows.iter().find_map(picker_window);
             let windows = windows.iter().filter_map(project_window).collect();
-            let changed = !state.has_windows || state.windows != windows;
+            let changed = !state.has_windows
+                || state.windows != windows
+                || state.picker_window != picker_window;
             state.windows = windows;
+            state.picker_window = picker_window;
             state.has_windows = true;
             return changed;
         } else if let Some(window) = event.pointer("/WindowOpenedOrChanged/window") {
             if is_picker(window) {
+                let picker_window = picker_window(window);
+                let changed = state.picker_window != picker_window;
+                state.picker_window = picker_window;
                 return window
                     .get("id")
                     .and_then(Value::as_u64)
-                    .is_some_and(|id| state.windows.remove(&id).is_some());
+                    .is_some_and(|id| state.windows.remove(&id).is_some())
+                    || changed;
             }
             if let Some((id, window)) = project_window(window)
                 && state.windows.get(&id) != Some(&window)
@@ -67,7 +99,24 @@ impl Store {
                 return true;
             }
         } else if let Some(id) = event.pointer("/WindowClosed/id").and_then(Value::as_u64) {
-            return state.windows.remove(&id).is_some();
+            let picker_closed = state
+                .picker_window
+                .is_some_and(|(picker_id, _)| picker_id == id);
+            if picker_closed {
+                state.picker_window = None;
+            }
+            return state.windows.remove(&id).is_some() || picker_closed;
+        } else if let Some(focus) = event.get("WindowFocusTimestampChanged") {
+            if let Some(window) = focus
+                .get("id")
+                .and_then(Value::as_u64)
+                .and_then(|id| state.windows.get_mut(&id))
+            {
+                let timestamp = focus.get("focus_timestamp").cloned().unwrap_or(Value::Null);
+                let changed = window["focus_timestamp"] != timestamp;
+                window["focus_timestamp"] = timestamp;
+                return changed;
+            }
         } else if let Some(workspaces) = event
             .pointer("/WorkspacesChanged/workspaces")
             .and_then(Value::as_array)
@@ -129,7 +178,14 @@ fn project_window(window: &Value) -> Option<(u64, Value)> {
     }
     let id = window.get("id")?.as_u64()?;
     let mut projected = serde_json::Map::new();
-    for key in ["id", "title", "app_id", "pid", "workspace_id"] {
+    for key in [
+        "id",
+        "title",
+        "app_id",
+        "pid",
+        "workspace_id",
+        "focus_timestamp",
+    ] {
         projected.insert(
             key.to_owned(),
             window.get(key).cloned().unwrap_or(Value::Null),
@@ -145,6 +201,16 @@ fn project_window(window: &Value) -> Option<(u64, Value)> {
         projected.insert("workspace_id".to_owned(), Value::from(0));
     }
     Some((id, Value::Object(projected)))
+}
+
+fn picker_window(window: &Value) -> Option<(u64, u64)> {
+    if !is_picker(window) {
+        return None;
+    }
+    Some((
+        window.get("id")?.as_u64()?,
+        window.get("workspace_id")?.as_u64()?,
+    ))
 }
 
 fn is_picker(window: &Value) -> bool {
@@ -345,6 +411,71 @@ mod tests {
         assert_eq!(workspaces[2]["is_active"], true);
         assert!(!store.apply(Ok(
             json!({"WorkspaceActivated": {"id": 2, "focused": true}})
+        )));
+    }
+
+    #[test]
+    fn picker_workspace_tracks_its_window_and_names_and_clears_on_close_or_disconnect() {
+        let store = Store::default();
+        store.apply(Ok(json!({"WorkspacesChanged": {"workspaces": [
+            {"id": 10, "idx": 1, "name": "code", "output": "DP-1"},
+            {"id": 20, "idx": 1, "name": null, "output": "DP-2", "is_focused": true}
+        ]}})));
+        let mut picker =
+            json!({"id": 1, "app_id": "picky", "pid": std::process::id(), "workspace_id": 10});
+        store.apply(Ok(json!({"WindowsChanged": {"windows": [picker.clone()]}})));
+        let captured = store.picker_workspace().unwrap();
+        assert_eq!(
+            captured,
+            LaunchWorkspace {
+                id: 10,
+                name: Some("code".to_owned())
+            }
+        );
+        assert!(store.windows::<Value>().unwrap().unwrap().is_empty());
+
+        picker["workspace_id"] = json!(20);
+        assert!(store.apply(Ok(json!({"WindowOpenedOrChanged": {"window": picker}}))));
+        assert_eq!(
+            store.picker_workspace(),
+            Some(LaunchWorkspace { id: 20, name: None })
+        );
+        assert_eq!(captured.name.as_deref(), Some("code"));
+        store.apply(Ok(json!({"WorkspacesChanged": {"workspaces": [
+            {"id": 20, "idx": 1, "name": "renamed", "output": "DP-2"}
+        ]}})));
+        assert_eq!(
+            store.picker_workspace().unwrap().name.as_deref(),
+            Some("renamed")
+        );
+
+        store.apply(Ok(json!({"WindowClosed": {"id": 1}})));
+        assert!(store.picker_workspace().is_none());
+        assert!(store.picker_workspace_id().is_none());
+        store.apply(Ok(json!({"WindowOpenedOrChanged": {"window": {
+            "id": 2, "app_id": "picky", "pid": std::process::id(), "workspace_id": 20
+        }}})));
+        assert_eq!(store.picker_workspace_id(), Some(20));
+        store.apply(Err("disconnected".to_owned()));
+        assert!(store.picker_workspace().is_none());
+        assert!(store.picker_workspace_id().is_none());
+    }
+
+    #[test]
+    fn focus_timestamp_events_update_recency_without_refreshing_for_identical_values() {
+        let store = Store::default();
+        store.apply(Ok(
+            json!({"WindowsChanged": {"windows": [{"id": 1, "workspace_id": 10}]}}),
+        ));
+        let update = json!({"WindowFocusTimestampChanged": {"id": 1, "focus_timestamp": {"secs": 7, "nanos": 5}}});
+        assert!(store.apply(Ok(update.clone())));
+        assert!(!store.apply(Ok(update)));
+        assert_eq!(
+            store.windows::<Value>().unwrap().unwrap()[0]["focus_timestamp"],
+            json!({"secs": 7, "nanos": 5})
+        );
+        assert!(!store.apply(Ok(
+            json!({"WindowFocusTimestampChanged": {"id": 99, "focus_timestamp": null}})
         )));
     }
 

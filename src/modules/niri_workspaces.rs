@@ -4,7 +4,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::fuzzy;
-use crate::module::{ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, SearchResult};
+use crate::module::{
+    ActivationOutcome, DEFAULT_ACTION_ID, LaunchWorkspace, MatchKind, Module, SearchResult,
+};
 
 const MODULE_KEY: &str = "niri-workspaces";
 
@@ -107,6 +109,8 @@ impl Module for NiriWorkspacesModule {
                     } else {
                         score
                     },
+                    application: None,
+                    window: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -122,7 +126,12 @@ impl Module for NiriWorkspacesModule {
         Ok(results)
     }
 
-    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome> {
+    fn activate(
+        &mut self,
+        item_id: &str,
+        action_id: &str,
+        _workspace: Option<&LaunchWorkspace>,
+    ) -> Result<ActivationOutcome> {
         if action_id != DEFAULT_ACTION_ID {
             anyhow::bail!("unknown workspace action: {action_id}");
         }
@@ -282,7 +291,7 @@ mod tests {
             state: Arc::clone(&state),
         }));
 
-        let outcome = module.activate("2", DEFAULT_ACTION_ID).unwrap();
+        let outcome = module.activate("2", DEFAULT_ACTION_ID, None).unwrap();
 
         assert_eq!(outcome, ActivationOutcome::ClosePicker);
         assert_eq!(
@@ -304,7 +313,7 @@ mod tests {
             state: Arc::clone(&state),
         }));
 
-        module.activate("3", DEFAULT_ACTION_ID).unwrap();
+        module.activate("3", DEFAULT_ACTION_ID, None).unwrap();
 
         assert_eq!(
             state.lock().unwrap().actions[1],

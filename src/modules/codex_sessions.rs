@@ -12,8 +12,8 @@ use serde::{Deserialize, Deserializer};
 
 use crate::fuzzy;
 use crate::module::{
-    ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, ResultAction, SearchResult,
-    sort_results,
+    ActivationOutcome, DEFAULT_ACTION_ID, LaunchWorkspace, MatchKind, Module, ResultAction,
+    SearchResult, sort_results,
 };
 
 const MODULE_KEY: &str = "codex-sessions";
@@ -54,7 +54,7 @@ impl SessionStore {
     pub fn merge_results(&self, query: &str, results: &mut Vec<SearchResult>) {
         results.retain(|result| result.module_key != MODULE_KEY);
         results.extend(self.search(query));
-        sort_results(results);
+        sort_results(results, None);
     }
 
     fn search(&self, query: &str) -> Vec<SearchResult> {
@@ -103,10 +103,12 @@ impl SessionStore {
                         Vec::new()
                     },
                     score,
+                    application: None,
+                    window: None,
                 })
             })
             .collect::<Vec<_>>();
-        sort_results(&mut results);
+        sort_results(&mut results, None);
         results
     }
 }
@@ -130,7 +132,12 @@ impl Module for CodexSessionsModule {
         Ok(self.sessions.search(query))
     }
 
-    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome> {
+    fn activate(
+        &mut self,
+        item_id: &str,
+        action_id: &str,
+        _workspace: Option<&LaunchWorkspace>,
+    ) -> Result<ActivationOutcome> {
         if action_id == ACKNOWLEDGE_ACTION_ID {
             ensure!(
                 self.sessions.indicator(item_id) == Some(SessionIndicator::Unread),
@@ -922,6 +929,8 @@ mod tests {
                 kind,
                 actions: Vec::new(),
                 score: if query.is_empty() { 0 } else { 100 },
+                application: None,
+                window: None,
             })
             .collect::<Vec<_>>();
 

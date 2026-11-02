@@ -8,7 +8,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 
 use crate::fuzzy;
-use crate::module::{ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, SearchResult};
+use crate::module::{
+    ActivationOutcome, ApplicationMatch, DEFAULT_ACTION_ID, LaunchWorkspace, MatchKind, Module,
+    SearchResult,
+};
 
 const MODULE_KEY: &str = "applications";
 
@@ -51,6 +54,7 @@ impl ApplicationStore {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplicationMetadata {
+    pub desktop_id: String,
     pub name: String,
     pub icon_name: Option<String>,
 }
@@ -62,25 +66,48 @@ struct ApplicationEntry {
     comment: String,
     keywords: String,
     icon_name: Option<String>,
+    startup_wm_class: Option<String>,
 }
 
 trait ApplicationLauncher: Send {
-    fn launch(&self, item_id: &str) -> Result<()>;
+    fn launch(&self, item_id: &str, workspace: Option<&LaunchWorkspace>) -> Result<()>;
 }
 
 struct ProcessApplicationLauncher;
 
 impl ApplicationLauncher for ProcessApplicationLauncher {
-    fn launch(&self, item_id: &str) -> Result<()> {
-        Command::new("gtk-launch")
-            .arg(item_id)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+    fn launch(&self, item_id: &str, workspace: Option<&LaunchWorkspace>) -> Result<()> {
+        launch_command(item_id, workspace)
             .spawn()
             .with_context(|| format!("failed to launch desktop entry {item_id}"))?;
 
         Ok(())
+    }
+}
+
+fn launch_command(item_id: &str, workspace: Option<&LaunchWorkspace>) -> Command {
+    let mut command = Command::new("gtk-launch");
+    command
+        .arg(item_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_remove("NIRI_LAUNCHED_FROM_WORKSPACE")
+        .env_remove("NIRI_LAUNCHED_FROM_WORKSPACE_ID");
+    if let Some(workspace) = workspace {
+        command.env("NIRI_LAUNCHED_FROM_WORKSPACE_ID", workspace.id.to_string());
+        if let Some(name) = &workspace.name {
+            command.env("NIRI_LAUNCHED_FROM_WORKSPACE", name);
+        }
+    }
+    command
+}
+
+pub(super) fn application_match(query: &str, name: &str, desktop_id: &str) -> ApplicationMatch {
+    ApplicationMatch {
+        desktop_id: desktop_id.to_owned(),
+        score: fuzzy::score_fields(query, &[(name, 110)])
+            .max(fuzzy::score_fields(query, &[(desktop_id, 30)])),
     }
 }
 
@@ -135,15 +162,24 @@ fn load_catalog_from(roots: &[PathBuf]) -> Result<Arc<ApplicationCatalog>> {
 fn build_application_index(entries: Vec<ApplicationEntry>) -> HashMap<String, ApplicationMetadata> {
     let mut applications = HashMap::new();
 
-    for entry in entries {
+    for entry in &entries {
         insert_application_aliases(
             &mut applications,
             &entry.id,
             ApplicationMetadata {
-                name: entry.name,
-                icon_name: entry.icon_name.filter(|icon| !icon.is_empty()),
+                desktop_id: entry.id.clone(),
+                name: entry.name.clone(),
+                icon_name: entry.icon_name.clone().filter(|icon| !icon.is_empty()),
             },
         );
+    }
+
+    // Explicit desktop IDs win over aliases shared by multiple entries.
+    for entry in &entries {
+        if let Some(alias) = &entry.startup_wm_class {
+            let metadata = applications[&entry.id].clone();
+            applications.entry(alias.clone()).or_insert(metadata);
+        }
     }
 
     applications
@@ -189,7 +225,7 @@ impl Module for ApplicationsModule {
                 Some(SearchResult {
                     module_key: MODULE_KEY,
                     item_id: entry.id.clone(),
-                    title: entry.name.clone(),
+                    title: format!("Launch {}", entry.name),
                     subtitle: if entry.comment.is_empty() {
                         entry.id.clone()
                     } else {
@@ -199,6 +235,8 @@ impl Module for ApplicationsModule {
                     kind: MatchKind::Application,
                     actions: Vec::new(),
                     score,
+                    application: Some(application_match(query, &entry.name, &entry.id)),
+                    window: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -213,12 +251,17 @@ impl Module for ApplicationsModule {
         Ok(results)
     }
 
-    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome> {
+    fn activate(
+        &mut self,
+        item_id: &str,
+        action_id: &str,
+        workspace: Option<&LaunchWorkspace>,
+    ) -> Result<ActivationOutcome> {
         if action_id != DEFAULT_ACTION_ID {
             anyhow::bail!("unknown application action: {action_id}");
         }
 
-        self.launcher.launch(item_id)?;
+        self.launcher.launch(item_id, workspace)?;
         Ok(ActivationOutcome::ClosePicker)
     }
 }
@@ -314,6 +357,7 @@ fn parse_entry_contents(
     let mut comment = None;
     let mut keywords = None;
     let mut icon_name = None;
+    let mut startup_wm_class = None;
     let mut exec = None;
     let mut no_display = false;
     let mut hidden = false;
@@ -346,6 +390,9 @@ fn parse_entry_contents(
                 keywords = Some(value.split(';').collect::<Vec<_>>().join(" "))
             }
             "Icon" if icon_name.is_none() => icon_name = Some(value.trim().to_string()),
+            "StartupWMClass" if startup_wm_class.is_none() && !value.trim().is_empty() => {
+                startup_wm_class = Some(value.trim().to_string())
+            }
             "Exec" if exec.is_none() => exec = Some(value.trim().to_string()),
             "NoDisplay" => no_display = parse_bool(value),
             "Hidden" => hidden = parse_bool(value),
@@ -378,6 +425,7 @@ fn parse_entry_contents(
         comment: comment.unwrap_or_default(),
         keywords: keywords.unwrap_or_default(),
         icon_name,
+        startup_wm_class,
     })
 }
 
@@ -398,6 +446,10 @@ fn parse_bool(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::module::{ModuleRegistry, sort_results};
+    use crate::modules::{niri_feed, niri_windows::NiriWindowsModule};
+    use serde_json::{Value, json};
+    use std::ffi::OsStr;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
@@ -406,7 +458,7 @@ mod tests {
     }
 
     impl ApplicationLauncher for FakeLauncher {
-        fn launch(&self, item_id: &str) -> Result<()> {
+        fn launch(&self, item_id: &str, _workspace: Option<&LaunchWorkspace>) -> Result<()> {
             self.launches.lock().unwrap().push(item_id.to_string());
             Ok(())
         }
@@ -419,7 +471,151 @@ mod tests {
             comment: comment.to_string(),
             keywords: keywords.to_string(),
             icon_name: None,
+            startup_wm_class: None,
         }
+    }
+
+    fn window_registry(mut windows: Vec<Value>) -> (ModuleRegistry, niri_feed::Store) {
+        let mut firefox = entry("firefox.desktop", "Firefox", "Web Browser", "browser web");
+        firefox.startup_wm_class = Some("Navigator".to_owned());
+        let applications = ApplicationsModule::with_launcher(
+            vec![
+                firefox,
+                entry("budget-manager.desktop", "Budget Manager", "", "finance"),
+            ],
+            Box::new(ProcessApplicationLauncher),
+        );
+        let feed = niri_feed::Store::default();
+        windows.push(
+            json!({"id": 99, "app_id": "picky", "pid": std::process::id(), "workspace_id": 10}),
+        );
+        feed.apply(Ok(json!({"WindowsChanged": {"windows": windows}})));
+        // Focus is deliberately elsewhere: ranking must use Picky's window.
+        feed.apply(Ok(json!({"WorkspacesChanged": {"workspaces": [
+            {"id": 10, "idx": 1, "name": "code", "output": "DP-1"},
+            {"id": 20, "idx": 1, "name": "other", "output": "DP-2", "is_focused": true}
+        ]}})));
+        let windows = NiriWindowsModule::with_store(feed.clone(), applications.store.clone());
+        (
+            ModuleRegistry::new(vec![Box::new(applications), Box::new(windows)]),
+            feed,
+        )
+    }
+
+    #[test]
+    fn application_search_orders_local_windows_by_recency_then_launch_then_remote_windows() {
+        let (mut registry, feed) = window_registry(vec![
+            json!({"id": 1, "title": "A Firefox", "app_id": "firefox", "pid": 111,
+                "workspace_id": 10, "focus_timestamp": {"secs": 10, "nanos": 0}}),
+            json!({"id": 2, "title": "Z notes", "app_id": "Navigator", "pid": 222,
+                "workspace_id": 10, "focus_timestamp": {"secs": 20, "nanos": 0}}),
+            json!({"id": 3, "title": "Firefox", "app_id": "firefox", "pid": 333,
+                "workspace_id": 20, "focus_timestamp": {"secs": 30, "nanos": 0}}),
+        ]);
+        let mut results = registry.search("firefox").unwrap();
+        sort_results(&mut results, feed.picker_workspace_id());
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.item_id.as_str())
+                .collect::<Vec<_>>(),
+            ["2:222", "1:111", "firefox.desktop", "3:333"]
+        );
+        assert_eq!(results[2].title, "Launch Firefox");
+
+        feed.apply(Ok(json!({"WindowFocusTimestampChanged": {
+            "id": 1, "focus_timestamp": {"secs": 40, "nanos": 0}
+        }})));
+        let mut results = registry.search("firefox").unwrap();
+        sort_results(&mut results, feed.picker_workspace_id());
+        assert_eq!(results[0].item_id, "1:111");
+
+        feed.apply(Ok(json!({"WindowOpenedOrChanged": {"window": {
+            "id": 99, "app_id": "picky", "pid": std::process::id(), "workspace_id": 20
+        }}})));
+        sort_results(&mut results, feed.picker_workspace_id());
+        assert_eq!(results[0].item_id, "3:333");
+        assert_eq!(results[1].item_id, "firefox.desktop");
+    }
+
+    #[test]
+    fn application_launch_precedes_windows_when_none_are_on_picker_workspace() {
+        let (mut registry, feed) = window_registry(vec![json!({
+            "id": 1, "title": "Firefox", "app_id": "firefox", "pid": 111, "workspace_id": 20
+        })]);
+        let mut results = registry.search("firefox").unwrap();
+        sort_results(&mut results, feed.picker_workspace_id());
+        assert_eq!(results[0].item_id, "firefox.desktop");
+        assert_eq!(results[1].item_id, "1:111");
+    }
+
+    #[test]
+    fn specific_remote_title_precedes_local_application_name_matches() {
+        let (mut registry, feed) = window_registry(vec![
+            json!({"id": 1, "title": "Schedule", "app_id": "budget-manager", "pid": 111, "workspace_id": 10}),
+            json!({"id": 2, "title": "Budget", "app_id": "firefox", "pid": 222, "workspace_id": 20}),
+        ]);
+        let mut results = registry.search("budget").unwrap();
+        sort_results(&mut results, feed.picker_workspace_id());
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.item_id.as_str())
+                .collect::<Vec<_>>(),
+            ["2:222", "1:111", "budget-manager.desktop"]
+        );
+    }
+
+    #[test]
+    fn mixed_application_and_title_query_finds_remote_window() {
+        let (mut registry, feed) = window_registry(vec![json!({
+            "id": 1, "title": "Quarterly budget", "app_id": "firefox", "pid": 111, "workspace_id": 20
+        })]);
+        let mut results = registry.search("firefox budget").unwrap();
+        sort_results(&mut results, feed.picker_workspace_id());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].item_id, "1:111");
+    }
+
+    #[test]
+    fn launch_environment_replaces_stale_workspace_values_and_preserves_unnamed_workspace_id() {
+        for (workspace, expected_name, expected_id) in [
+            (
+                Some(LaunchWorkspace {
+                    id: 7,
+                    name: Some("Project A 'quoted'".to_owned()),
+                }),
+                Some(OsStr::new("Project A 'quoted'")),
+                Some(OsStr::new("7")),
+            ),
+            (
+                Some(LaunchWorkspace { id: 8, name: None }),
+                None,
+                Some(OsStr::new("8")),
+            ),
+            (None, None, None),
+        ] {
+            let command = launch_command("firefox.desktop", workspace.as_ref());
+            let environment = command.get_envs().collect::<HashMap<_, _>>();
+            assert_eq!(
+                environment.get(OsStr::new("NIRI_LAUNCHED_FROM_WORKSPACE")),
+                Some(&expected_name)
+            );
+            assert_eq!(
+                environment.get(OsStr::new("NIRI_LAUNCHED_FROM_WORKSPACE_ID")),
+                Some(&expected_id)
+            );
+        }
+    }
+
+    #[test]
+    fn startup_wm_class_alias_resolves_to_canonical_desktop_entry() {
+        let parsed = parse_entry_contents(
+            "[Desktop Entry]\nType=Application\nName=Firefox\nExec=firefox\nStartupWMClass=Navigator\n",
+            Path::new("/tmp/apps"), Path::new("/tmp/apps/firefox.desktop"),
+        ).unwrap();
+        let applications = build_application_index(vec![parsed]);
+        assert_eq!(applications["Navigator"].desktop_id, "firefox.desktop");
     }
 
     #[test]
@@ -484,7 +680,7 @@ mod tests {
 
         let results = module.search("fire").unwrap();
 
-        assert_eq!(results[0].title, "Firefox");
+        assert_eq!(results[0].title, "Launch Firefox");
         assert_eq!(results[0].module_key, MODULE_KEY);
     }
 
@@ -500,6 +696,7 @@ mod tests {
         assert_eq!(
             applications.get("org.mozilla.Firefox.desktop"),
             Some(&ApplicationMetadata {
+                desktop_id: "org.mozilla.Firefox.desktop".to_owned(),
                 name: "Firefox".to_string(),
                 icon_name: None,
             })
@@ -507,6 +704,7 @@ mod tests {
         assert_eq!(
             applications.get("org.mozilla.Firefox"),
             Some(&ApplicationMetadata {
+                desktop_id: "org.mozilla.Firefox.desktop".to_owned(),
                 name: "Firefox".to_string(),
                 icon_name: None,
             })
@@ -525,7 +723,7 @@ mod tests {
         );
 
         let outcome = module
-            .activate("org.mozilla.Firefox.desktop", DEFAULT_ACTION_ID)
+            .activate("org.mozilla.Firefox.desktop", DEFAULT_ACTION_ID, None)
             .unwrap();
 
         assert_eq!(outcome, ActivationOutcome::ClosePicker);
@@ -547,7 +745,7 @@ mod tests {
         );
         module.store.replace(replacement.store.snapshot());
         assert!(module.search("old").unwrap().is_empty());
-        assert_eq!(module.search("new").unwrap()[0].title, "New browser");
+        assert_eq!(module.search("new").unwrap()[0].title, "Launch New browser");
         assert_eq!(
             module.store.snapshot().metadata["browser"].name,
             "New browser"

@@ -11,8 +11,8 @@ use zbus::zvariant::OwnedValue;
 
 use crate::fuzzy;
 use crate::module::{
-    ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, ResultAction, SearchResult,
-    sort_results,
+    ActivationOutcome, DEFAULT_ACTION_ID, LaunchWorkspace, MatchKind, Module, ResultAction,
+    SearchResult, sort_results,
 };
 
 const MODULE_KEY: &str = "mako-notifications";
@@ -91,7 +91,7 @@ impl NotificationStore {
     pub fn merge_results(&self, query: &str, results: &mut Vec<SearchResult>) {
         results.retain(|result| result.module_key != MODULE_KEY);
         results.extend(self.search(query));
-        sort_results(results);
+        sort_results(results, None);
     }
 
     fn search(&self, query: &str) -> Vec<SearchResult> {
@@ -146,6 +146,8 @@ impl NotificationStore {
                         },
                     ],
                     score,
+                    application: None,
+                    window: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -170,7 +172,12 @@ impl Module for MakoNotificationsModule {
         Ok(self.notifications.search(query))
     }
 
-    fn activate(&mut self, item_id: &str, action_id: &str) -> Result<ActivationOutcome> {
+    fn activate(
+        &mut self,
+        item_id: &str,
+        action_id: &str,
+        _workspace: Option<&LaunchWorkspace>,
+    ) -> Result<ActivationOutcome> {
         match action_id {
             DEFAULT_ACTION_ID => {
                 if self.client.invoke(item_id)? {
@@ -559,7 +566,7 @@ mod tests {
             }),
         );
 
-        let outcome = module.activate("42", DEFAULT_ACTION_ID).unwrap();
+        let outcome = module.activate("42", DEFAULT_ACTION_ID, None).unwrap();
 
         assert_eq!(outcome, ActivationOutcome::ClosePicker);
         let state = state.lock().unwrap();
@@ -580,7 +587,7 @@ mod tests {
             }),
         );
 
-        let outcome = module.activate("42", DEFAULT_ACTION_ID).unwrap();
+        let outcome = module.activate("42", DEFAULT_ACTION_ID, None).unwrap();
 
         assert_eq!(outcome, ActivationOutcome::ClosePicker);
         assert_eq!(state.lock().unwrap().dismisses.as_slice(), ["42"]);
@@ -599,7 +606,7 @@ mod tests {
             }),
         );
 
-        let outcome = module.activate("42", GO_TO_ACTION_ID).unwrap();
+        let outcome = module.activate("42", GO_TO_ACTION_ID, None).unwrap();
 
         assert_eq!(outcome, ActivationOutcome::ClosePicker);
         let state = state.lock().unwrap();
@@ -617,7 +624,7 @@ mod tests {
             }),
         );
 
-        let outcome = module.activate("42", DISMISS_ACTION_ID).unwrap();
+        let outcome = module.activate("42", DISMISS_ACTION_ID, None).unwrap();
 
         assert_eq!(outcome, ActivationOutcome::RefreshResults);
         assert_eq!(state.lock().unwrap().dismisses.as_slice(), ["42"]);
