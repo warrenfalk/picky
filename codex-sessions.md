@@ -18,8 +18,16 @@ the indexes with fresh snapshots; searches use direct Niri queries while the fee
 is unavailable. Visible results coalesce relevant changes at 100 ms intervals,
 preserving selection by identity while navigating. Layout-only events do not
 refresh results. Thumbnails are fetched only for visible rows and regenerated
-on each opening. Sources without live feeds are searched again on opening;
-application entries and icon indexes remain cached for the process lifetime.
+on each opening. Sources without live feeds are searched again on opening.
+
+Application entries and window application metadata share a live catalog. One
+filesystem watcher monitors mutable application directories and the mutable
+parents of profile symlinks; it never watches `/nix/store` contents or icon
+trees. Installation events are coalesced for 200 ms before a background scan,
+and the watch set follows directory creation and profile switches. Each opening
+also rechecks the catalog. Failed scans retain the previous snapshot. Relevant
+changes invalidate icon lookup, which rebuilds in the background when the picker
+is visible; unchanged reopen scans reuse the existing icon index.
 
 With an empty query, sessions appear below notifications in this order: error,
 approval, input, other attention, unread, then working.

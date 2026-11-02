@@ -11,7 +11,7 @@ use crate::fuzzy::WeightedField;
 use crate::module::{
     ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, ResultAction, SearchResult,
 };
-use crate::modules::applications::ApplicationMetadata;
+use crate::modules::applications::{ApplicationMetadata, ApplicationStore};
 
 const MODULE_KEY: &str = "niri-windows";
 const CLOSE_ACTION_ID: &str = "close";
@@ -22,7 +22,7 @@ const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct NiriWindowsModule {
     store: Option<super::niri_feed::Store>,
-    application_index: HashMap<String, ApplicationMetadata>,
+    applications: ApplicationStore,
     backend: Box<dyn WindowsBackend>,
 }
 
@@ -90,28 +90,22 @@ impl WindowsBackend for ProcessWindowsBackend {
 }
 
 impl NiriWindowsModule {
-    pub fn with_store(store: super::niri_feed::Store) -> Self {
-        let mut module = Self::new();
-        module.store = Some(store);
-        module
-    }
-    pub fn new() -> Self {
-        let application_index = crate::modules::applications::load_application_index()
-            .unwrap_or_else(|err| {
-                eprintln!("failed to load application index: {err:#}");
-                HashMap::new()
-            });
-
-        Self::with_backend(application_index, Box::new(ProcessWindowsBackend))
+    pub fn with_store(store: super::niri_feed::Store, applications: ApplicationStore) -> Self {
+        Self {
+            store: Some(store),
+            applications,
+            backend: Box::new(ProcessWindowsBackend),
+        }
     }
 
+    #[cfg(test)]
     fn with_backend(
         application_index: HashMap<String, ApplicationMetadata>,
         backend: Box<dyn WindowsBackend>,
     ) -> Self {
         Self {
             store: None,
-            application_index,
+            applications: ApplicationStore::with_metadata(application_index),
             backend,
         }
     }
@@ -179,6 +173,7 @@ impl Module for NiriWindowsModule {
 
     fn search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
         let query = query.trim();
+        let applications = self.applications.snapshot();
         let windows = match self.store.as_ref().and_then(|store| store.windows()) {
             Some(windows) => windows?,
             None => self.backend.load_windows()?,
@@ -207,7 +202,7 @@ impl Module for NiriWindowsModule {
                     .map(|workspace| workspace.output.as_str())
                     .unwrap_or("unknown output");
                 let application_label =
-                    application_label_for_window(&self.application_index, &window.app_id);
+                    application_label_for_window(&applications.metadata, &window.app_id);
                 let score = score_window(
                     query,
                     application_label,
@@ -229,7 +224,7 @@ impl Module for NiriWindowsModule {
                         item_id: encode_window_target(window.id, window.pid),
                         title: window.title,
                         subtitle,
-                        icon_name: icon_name_for_app_id(&self.application_index, &window.app_id),
+                        icon_name: icon_name_for_app_id(&applications.metadata, &window.app_id),
                         kind: MatchKind::Window,
                         actions: vec![
                             ResultAction {
@@ -661,6 +656,31 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Project notes");
         assert_eq!(results[0].subtitle, "Firefox  code on DP-1");
+    }
+
+    #[test]
+    fn search_uses_refreshed_application_metadata_without_rebuilding_the_module() {
+        let state = Arc::new(Mutex::new(FakeState {
+            windows: vec![window(1, "Project notes", "browser", Some(111), 10)],
+            workspaces: vec![workspace(10, 2, Some("code"), "DP-1")],
+            ..FakeState::default()
+        }));
+        let mut module = NiriWindowsModule::with_backend(
+            HashMap::from([("browser".to_owned(), application("Old browser"))]),
+            Box::new(FakeWindowsBackend { state }),
+        );
+        let updated = ApplicationStore::with_metadata(HashMap::from([(
+            "browser".to_owned(),
+            ApplicationMetadata {
+                name: "New browser".to_owned(),
+                icon_name: Some("new-icon".to_owned()),
+            },
+        )]));
+        module.applications.replace(updated.snapshot());
+        assert!(module.search("old").unwrap().is_empty());
+        let results = module.search("new").unwrap();
+        assert_eq!(results[0].subtitle, "New browser  code on DP-1");
+        assert_eq!(results[0].icon_name.as_deref(), Some("new-icon"));
     }
 
     #[test]

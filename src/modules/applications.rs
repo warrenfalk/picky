@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
@@ -12,8 +13,40 @@ use crate::module::{ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, Module, Sea
 const MODULE_KEY: &str = "applications";
 
 pub struct ApplicationsModule {
-    entries: Vec<ApplicationEntry>,
+    store: ApplicationStore,
     launcher: Box<dyn ApplicationLauncher>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ApplicationStore(Arc<Mutex<Arc<ApplicationCatalog>>>);
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct ApplicationCatalog {
+    entries: Vec<ApplicationEntry>,
+    pub metadata: HashMap<String, ApplicationMetadata>,
+    // Detect profile switches even when the new desktop metadata is identical.
+    sources: Vec<PathBuf>,
+}
+
+impl ApplicationStore {
+    pub fn snapshot(&self) -> Arc<ApplicationCatalog> {
+        self.0.lock().unwrap().clone()
+    }
+
+    pub fn replace(&self, catalog: Arc<ApplicationCatalog>) -> bool {
+        let mut current = self.0.lock().unwrap();
+        let changed = *current != catalog;
+        *current = catalog;
+        changed
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_metadata(metadata: HashMap<String, ApplicationMetadata>) -> Self {
+        Self(Arc::new(Mutex::new(Arc::new(ApplicationCatalog {
+            metadata,
+            ..ApplicationCatalog::default()
+        }))))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,7 +55,7 @@ pub struct ApplicationMetadata {
     pub icon_name: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ApplicationEntry {
     id: String,
     name: String,
@@ -52,26 +85,51 @@ impl ApplicationLauncher for ProcessApplicationLauncher {
 }
 
 impl ApplicationsModule {
-    pub fn new() -> Self {
-        Self::with_launcher(
-            load_entries().unwrap_or_else(|err| {
-                eprintln!("failed to load desktop entries: {err:#}");
-                Vec::new()
-            }),
-            Box::new(ProcessApplicationLauncher),
-        )
+    pub fn new(store: ApplicationStore) -> Self {
+        Self {
+            store,
+            launcher: Box::new(ProcessApplicationLauncher),
+        }
     }
 
+    #[cfg(test)]
     fn with_launcher(
         entries: Vec<ApplicationEntry>,
         launcher: Box<dyn ApplicationLauncher>,
     ) -> Self {
-        Self { entries, launcher }
+        let store = ApplicationStore::default();
+        store.replace(Arc::new(ApplicationCatalog {
+            metadata: build_application_index(entries.clone()),
+            entries,
+            sources: Vec::new(),
+        }));
+        Self { store, launcher }
     }
 }
 
-pub fn load_application_index() -> Result<HashMap<String, ApplicationMetadata>> {
-    Ok(build_application_index(load_entries()?))
+pub fn load_catalog() -> Result<Arc<ApplicationCatalog>> {
+    load_catalog_from(&application_dirs())
+}
+
+fn load_catalog_from(roots: &[PathBuf]) -> Result<Arc<ApplicationCatalog>> {
+    // Resolve each root once so a profile switch cannot mix generations within
+    // a scan. A later watcher event (or reopening) picks up the next generation.
+    let mut sources = Vec::new();
+    for root in roots {
+        match root.canonicalize() {
+            Ok(source) => sources.push(source),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to resolve {}", root.display()));
+            }
+        }
+    }
+    let entries = load_entries(&sources)?;
+    Ok(Arc::new(ApplicationCatalog {
+        metadata: build_application_index(entries.clone()),
+        entries,
+        sources,
+    }))
 }
 
 fn build_application_index(entries: Vec<ApplicationEntry>) -> HashMap<String, ApplicationMetadata> {
@@ -113,7 +171,8 @@ impl Module for ApplicationsModule {
     fn search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
         let query = query.trim();
 
-        let mut results = self
+        let catalog = self.store.snapshot();
+        let mut results = catalog
             .entries
             .iter()
             .filter_map(|entry| {
@@ -164,20 +223,20 @@ impl Module for ApplicationsModule {
     }
 }
 
-fn load_entries() -> Result<Vec<ApplicationEntry>> {
+fn load_entries(roots: &[PathBuf]) -> Result<Vec<ApplicationEntry>> {
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
 
-    for applications_dir in application_dirs() {
+    for applications_dir in roots {
         if !applications_dir.exists() {
             continue;
         }
 
         let mut desktop_files = Vec::new();
-        collect_desktop_files(&applications_dir, &mut desktop_files)?;
+        collect_desktop_files(applications_dir, &mut desktop_files)?;
 
         for desktop_file in desktop_files {
-            let Some(entry) = parse_entry(&applications_dir, &desktop_file)? else {
+            let Some(entry) = parse_entry(applications_dir, &desktop_file)? else {
                 continue;
             };
 
@@ -190,7 +249,7 @@ fn load_entries() -> Result<Vec<ApplicationEntry>> {
     Ok(entries)
 }
 
-fn application_dirs() -> Vec<PathBuf> {
+pub(super) fn application_dirs() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
     let data_home = env::var_os("XDG_DATA_HOME")
@@ -474,5 +533,65 @@ mod tests {
             launches.lock().unwrap().as_slice(),
             ["org.mozilla.Firefox.desktop"]
         );
+    }
+
+    #[test]
+    fn catalog_replacement_updates_search_and_metadata_together() {
+        let mut module = ApplicationsModule::with_launcher(
+            vec![entry("browser.desktop", "Old browser", "", "")],
+            Box::new(ProcessApplicationLauncher),
+        );
+        let replacement = ApplicationsModule::with_launcher(
+            vec![entry("browser.desktop", "New browser", "", "")],
+            Box::new(ProcessApplicationLauncher),
+        );
+        module.store.replace(replacement.store.snapshot());
+        assert!(module.search("old").unwrap().is_empty());
+        assert_eq!(module.search("new").unwrap()[0].title, "New browser");
+        assert_eq!(
+            module.store.snapshot().metadata["browser"].name,
+            "New browser"
+        );
+        module
+            .store
+            .replace(Arc::new(ApplicationCatalog::default()));
+        assert!(module.search("").unwrap().is_empty());
+        assert!(module.store.snapshot().metadata.is_empty());
+    }
+
+    #[test]
+    fn profile_switches_invalidate_the_catalog_even_when_metadata_is_unchanged() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("picky-catalog-{}-{unique}", std::process::id()));
+        for generation in ["first", "second"] {
+            let directory = root.join(generation).join("applications");
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("test.desktop"),
+                "[Desktop Entry]\nType=Application\nName=Test\nExec=test\n",
+            )
+            .unwrap();
+        }
+        let profile = root.join("profile");
+        symlink("first", &profile).unwrap();
+        let roots = [profile.join("applications")];
+        let first = load_catalog_from(&roots).unwrap();
+        symlink("second", root.join("next-profile")).unwrap();
+        fs::rename(root.join("next-profile"), &profile).unwrap();
+        let second = load_catalog_from(&roots).unwrap();
+        assert_eq!(first.entries, second.entries);
+        assert_eq!(first.metadata, second.metadata);
+        let store = ApplicationStore::default();
+        assert!(store.replace(first));
+        assert!(store.replace(second));
+        assert!(!store.replace(load_catalog_from(&roots).unwrap()));
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::launcher::{self, ActivationServer};
@@ -14,6 +14,7 @@ use crate::module::{
     ActivationOutcome, DEFAULT_ACTION_ID, MatchKind, ModuleRegistry, ResultAction, SearchResult,
 };
 use crate::modules;
+use crate::modules::applications::{self, ApplicationCatalog, ApplicationStore};
 use crate::modules::codex_sessions::{self, FeedUpdate, SessionIndicator, SessionStore};
 use crate::modules::mako_notifications::{self, NotificationStore};
 use crate::modules::niri_feed;
@@ -110,10 +111,19 @@ enum Message {
     KeyPressed(AppKey),
     SystemInfoLoaded(system::Information),
     StartupFinished(StartupContext),
-    IconIndexFinished(Arc<IconIndex>),
+    ApplicationsChanged(modules::applications_watch::Update),
+    ApplicationsRefreshFinished(Result<Arc<ApplicationCatalog>, String>),
+    IconIndexFinished {
+        request_id: u64,
+        index: Arc<IconIndex>,
+    },
     CodexSessionsChanged(FeedUpdate),
     NotificationsChanged(mako_notifications::FeedUpdate),
     SearchFinished {
+        request_id: u64,
+        result: Result<Vec<SearchResult>, String>,
+    },
+    LiveSearchFinished {
         request_id: u64,
         result: Result<Vec<SearchResult>, String>,
     },
@@ -138,11 +148,16 @@ pub struct PickerApp {
     niri_search_pending: bool,
     window_is_focused: bool,
     registry: Option<Arc<Mutex<ModuleRegistry>>>,
+    applications: ApplicationStore,
+    is_refreshing_applications: bool,
+    applications_dirty: bool,
+    application_icons_dirty: bool,
     codex_sessions: SessionStore,
     codex_error: String,
     notifications: NotificationStore,
     notification_error: String,
     icon_index: Option<Arc<IconIndex>>,
+    icon_index_request_id: u64,
     query: String,
     error_message: String,
     renderer_warning: String,
@@ -290,6 +305,8 @@ fn initialize(server: Arc<ActivationServer>) -> (PickerApp, Task<Message>) {
     let startup_niri = niri.clone();
     let notifications = NotificationStore::default();
     let startup_notifications = notifications.clone();
+    let applications = ApplicationStore::default();
+    let startup_applications = applications.clone();
     let mut app = PickerApp {
         pending_actions: HashSet::new(),
         window_id: None,
@@ -301,11 +318,16 @@ fn initialize(server: Arc<ActivationServer>) -> (PickerApp, Task<Message>) {
         niri_search_pending: false,
         window_is_focused: false,
         registry: None,
+        applications,
+        is_refreshing_applications: false,
+        applications_dirty: false,
+        application_icons_dirty: false,
         codex_sessions,
         codex_error: String::new(),
         notifications,
         notification_error: String::new(),
         icon_index: None,
+        icon_index_request_id: 0,
         query: String::new(),
         error_message: String::new(),
         renderer_warning: String::new(),
@@ -329,7 +351,12 @@ fn initialize(server: Arc<ActivationServer>) -> (PickerApp, Task<Message>) {
         app.show(),
         Task::perform(
             background(move || {
-                load_startup_context(startup_sessions, startup_niri, startup_notifications)
+                load_startup_context(
+                    startup_sessions,
+                    startup_niri,
+                    startup_notifications,
+                    startup_applications,
+                )
             }),
             Message::StartupFinished,
         ),
@@ -350,6 +377,7 @@ fn subscription(app: &PickerApp) -> Subscription<Message> {
         codex_sessions::subscription().map(Message::CodexSessionsChanged),
         mako_notifications::subscription().map(Message::NotificationsChanged),
         niri_feed::subscription().map(Message::NiriChanged),
+        modules::applications_watch::subscription().map(Message::ApplicationsChanged),
     ];
     if let Some(server) = &app.activation_server {
         subscriptions.push(launcher::subscription(server.clone()).map(Message::ResidentRequest));
@@ -566,9 +594,45 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
             app.registry = Some(startup.registry);
             app.request_search()
         }
-        Message::IconIndexFinished(icon_index) => {
+        Message::ApplicationsChanged(update) => {
+            if let Err(error) = update {
+                eprintln!("application watcher: {error}");
+                return Task::none();
+            }
+            app.application_icons_dirty = true;
+            app.request_application_refresh()
+        }
+        Message::ApplicationsRefreshFinished(result) => {
+            app.is_refreshing_applications = false;
+            if app.applications_dirty {
+                return app.request_application_refresh();
+            }
+            match result {
+                Ok(catalog) => {
+                    let changed = app.applications.replace(catalog);
+                    if !changed && !app.application_icons_dirty {
+                        return app.request_icon_index();
+                    }
+                    app.application_icons_dirty = false;
+                    app.icon_index_request_id += 1;
+                    app.icon_index = None;
+                    Task::batch([app.request_icon_index(), app.request_search_with_mode(true)])
+                }
+                Err(error) => {
+                    // An incomplete scan must not replace the last good catalog.
+                    eprintln!("failed to refresh desktop entries: {error}");
+                    Task::none()
+                }
+            }
+        }
+        Message::IconIndexFinished { request_id, index } => {
             app.is_loading_icon_index = false;
-            app.icon_index = Some(icon_index);
+            if request_id != app.icon_index_request_id {
+                // Finish the obsolete worker before starting another scan.
+                // Repeated updates must not spawn overlapping icon traversals.
+                return app.request_icon_index();
+            }
+            app.icon_index = Some(index);
             Task::none()
         }
         Message::CodexSessionsChanged(update) => {
@@ -613,6 +677,24 @@ fn update(app: &mut PickerApp, message: Message) -> Task<Message> {
             FocusTarget::Search => app.handle_search_key(key),
             FocusTarget::Results => app.handle_results_key(key),
         },
+        Message::LiveSearchFinished { request_id, result } => {
+            if request_id != app.active_search_request_id {
+                return Task::none();
+            }
+            app.niri_dirty = true;
+            match result {
+                Ok(mut results) => {
+                    app.codex_sessions.merge_results(&app.query, &mut results);
+                    app.notifications.merge_results(&app.query, &mut results);
+                    app.error_message.clear();
+                    app.replace_live_results(results)
+                }
+                Err(error) => {
+                    app.error_message = error;
+                    Task::none()
+                }
+            }
+        }
         Message::SearchFinished { request_id, result } => {
             if request_id != app.active_search_request_id {
                 return Task::none();
@@ -1188,7 +1270,7 @@ fn visible_row_ids_for_viewport(
 impl PickerApp {
     fn show(&mut self) -> Task<Message> {
         if self.window_id.is_some() {
-            return Task::perform(
+            let focus_task = Task::perform(
                 background(|| modules::niri_windows::focus_picker_window(std::process::id())),
                 |result| {
                     if let Err(error) = result {
@@ -1197,6 +1279,7 @@ impl PickerApp {
                     Message::NiriTick
                 },
             );
+            return Task::batch([focus_task, self.request_application_refresh()]);
         }
         self.generation += 1;
         self.window_is_focused = false;
@@ -1216,6 +1299,7 @@ impl PickerApp {
         Task::batch([
             open.map(move |id| Message::WindowOpened(id, generation)),
             self.request_search(),
+            self.request_application_refresh(),
         ])
     }
 
@@ -1313,17 +1397,42 @@ impl PickerApp {
         }
     }
 
+    fn request_application_refresh(&mut self) -> Task<Message> {
+        if self.is_refreshing_applications {
+            self.applications_dirty = true;
+            return Task::none();
+        }
+        self.is_refreshing_applications = true;
+        self.applications_dirty = false;
+        Task::perform(
+            background(|| applications::load_catalog().map_err(|error| format!("{error:#}"))),
+            Message::ApplicationsRefreshFinished,
+        )
+    }
+
     fn request_icon_index(&mut self) -> Task<Message> {
-        if self.icon_index.is_some() || self.is_loading_icon_index {
+        if self.window_id.is_none()
+            || self.is_refreshing_applications
+            || self.icon_index.is_some()
+            || self.is_loading_icon_index
+        {
             return Task::none();
         }
 
         self.is_loading_icon_index = true;
+        self.icon_index_request_id += 1;
+        let request_id = self.icon_index_request_id;
 
-        Task::perform(background(load_icon_index), Message::IconIndexFinished)
+        Task::perform(background(load_icon_index), move |index| {
+            Message::IconIndexFinished { request_id, index }
+        })
     }
 
     fn request_search(&mut self) -> Task<Message> {
+        self.request_search_with_mode(false)
+    }
+
+    fn request_search_with_mode(&mut self, live: bool) -> Task<Message> {
         if self.window_id.is_none() {
             return Task::none();
         }
@@ -1342,7 +1451,13 @@ impl PickerApp {
 
         Task::perform(
             background(move || search_registry(registry, &query)),
-            move |result| Message::SearchFinished { request_id, result },
+            move |result| {
+                if live {
+                    Message::LiveSearchFinished { request_id, result }
+                } else {
+                    Message::SearchFinished { request_id, result }
+                }
+            },
         )
     }
 
@@ -1813,8 +1928,6 @@ fn window_thumbnail_visual(
         .into()
 }
 
-static ICON_SEARCH_ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
-
 #[derive(Clone, Debug, Default)]
 struct IconIndex {
     paths: HashMap<String, PathBuf>,
@@ -1858,9 +1971,7 @@ struct IconCandidate {
 }
 
 fn load_icon_index() -> Arc<IconIndex> {
-    Arc::new(build_icon_index(
-        ICON_SEARCH_ROOTS.get_or_init(build_icon_search_roots),
-    ))
+    Arc::new(build_icon_index(&build_icon_search_roots()))
 }
 
 fn build_icon_index(roots: &[PathBuf]) -> IconIndex {
@@ -2319,12 +2430,14 @@ fn load_startup_context(
     codex_sessions: SessionStore,
     niri: niri_feed::Store,
     notifications: NotificationStore,
+    applications: ApplicationStore,
 ) -> StartupContext {
     StartupContext {
         registry: Arc::new(Mutex::new(ModuleRegistry::new(modules::default_modules(
             codex_sessions,
             niri,
             notifications,
+            applications,
         )))),
     }
 }
@@ -2347,11 +2460,16 @@ mod tests {
             niri_search_pending: false,
             window_is_focused: false,
             registry: Some(Arc::new(Mutex::new(ModuleRegistry::new(Vec::new())))),
+            applications: ApplicationStore::default(),
+            is_refreshing_applications: false,
+            applications_dirty: false,
+            application_icons_dirty: false,
             codex_sessions: SessionStore::default(),
             codex_error: String::new(),
             notifications: NotificationStore::default(),
             notification_error: String::new(),
             icon_index: None,
+            icon_index_request_id: 0,
             query: String::new(),
             error_message: String::new(),
             renderer_warning: String::new(),
@@ -2736,6 +2854,163 @@ mod tests {
         assert!(app.results.is_empty());
         assert!(app.window_thumbnails.is_empty());
         assert!(Arc::ptr_eq(app.registry.as_ref().unwrap(), &registry));
+    }
+
+    #[test]
+    fn reopening_rechecks_applications_and_coalesces_refreshes() {
+        let mut app = app_with_results(Vec::new());
+        let _ = app.dismiss();
+        let _ = app.show();
+        assert!(app.is_refreshing_applications);
+        assert!(!app.applications_dirty);
+        assert_eq!(app.request_application_refresh().units(), 0);
+        assert!(app.applications_dirty);
+        assert_eq!(
+            update(
+                &mut app,
+                Message::ApplicationsRefreshFinished(Ok(Arc::new(ApplicationCatalog::default())),)
+            )
+            .units(),
+            1
+        );
+        assert!(app.is_refreshing_applications);
+        assert!(!app.applications_dirty);
+    }
+
+    #[test]
+    fn hidden_application_changes_refresh_the_catalog_and_defer_icon_work() {
+        let mut app = app_with_results(Vec::new());
+        let _ = app.dismiss();
+        app.icon_index = Some(Arc::new(IconIndex::default()));
+        assert_eq!(
+            update(&mut app, Message::ApplicationsChanged(Ok(()))).units(),
+            1
+        );
+        let replacement = Arc::new(ApplicationCatalog::default());
+        assert_eq!(
+            update(
+                &mut app,
+                Message::ApplicationsRefreshFinished(Ok(replacement.clone()))
+            )
+            .units(),
+            0
+        );
+        assert!(Arc::ptr_eq(&app.applications.snapshot(), &replacement));
+        assert!(app.icon_index.is_none());
+        assert!(!app.is_loading_icon_index);
+    }
+
+    #[test]
+    fn a_failed_application_refresh_keeps_the_last_good_catalog_and_icons() {
+        let mut app = app_with_results(Vec::new());
+        let catalog = app.applications.snapshot();
+        let icons = Arc::new(IconIndex::default());
+        app.icon_index = Some(icons.clone());
+        app.is_refreshing_applications = true;
+        let _ = update(
+            &mut app,
+            Message::ApplicationsRefreshFinished(Err("incomplete scan".to_owned())),
+        );
+        assert!(Arc::ptr_eq(&app.applications.snapshot(), &catalog));
+        assert!(Arc::ptr_eq(app.icon_index.as_ref().unwrap(), &icons));
+        assert!(!app.is_refreshing_applications);
+    }
+
+    #[test]
+    fn stale_icon_index_completions_cannot_replace_a_newer_index() {
+        let mut app = app_with_results(Vec::new());
+        app.icon_index_request_id = 2;
+        app.is_loading_icon_index = true;
+        assert_eq!(
+            update(
+                &mut app,
+                Message::IconIndexFinished {
+                    request_id: 1,
+                    index: Arc::new(IconIndex::default()),
+                },
+            )
+            .units(),
+            1
+        );
+        assert!(app.icon_index.is_none());
+        assert!(app.is_loading_icon_index);
+        let current_request = app.icon_index_request_id;
+        let current = Arc::new(IconIndex::default());
+        let _ = update(
+            &mut app,
+            Message::IconIndexFinished {
+                request_id: current_request,
+                index: current.clone(),
+            },
+        );
+        assert!(Arc::ptr_eq(app.icon_index.as_ref().unwrap(), &current));
+        assert!(!app.is_loading_icon_index);
+    }
+
+    #[test]
+    fn invalidating_icons_during_a_scan_defers_the_next_scan() {
+        let mut app = app_with_results(Vec::new());
+        app.is_loading_icon_index = true;
+        app.icon_index_request_id = 1;
+        for _ in 0..2 {
+            app.application_icons_dirty = true;
+            // Only the live search starts; the existing icon worker stays active.
+            assert_eq!(
+                update(
+                    &mut app,
+                    Message::ApplicationsRefreshFinished(Ok(Arc::new(
+                        ApplicationCatalog::default()
+                    )),)
+                )
+                .units(),
+                1
+            );
+            assert!(app.is_loading_icon_index);
+        }
+        assert_eq!(
+            update(
+                &mut app,
+                Message::IconIndexFinished {
+                    request_id: 1,
+                    index: Arc::new(IconIndex::default()),
+                }
+            )
+            .units(),
+            1
+        );
+        assert!(app.is_loading_icon_index);
+        assert!(app.icon_index.is_none());
+    }
+
+    #[test]
+    fn application_refresh_search_preserves_selection_and_rejects_stale_results() {
+        let first = result("First", Vec::new());
+        let second = result("Second", Vec::new());
+        let mut app = app_with_results(vec![first.clone(), second.clone()]);
+        app.focus_target = FocusTarget::Results;
+        app.selected_index = Some(1);
+        app.active_search_request_id = 2;
+        app.query = "current query".to_owned();
+        let _ = update(
+            &mut app,
+            Message::LiveSearchFinished {
+                request_id: 1,
+                result: Ok(Vec::new()),
+            },
+        );
+        assert_eq!(app.selected_index, Some(1));
+        let mut moved = second.clone();
+        moved.score = 100;
+        let _ = update(
+            &mut app,
+            Message::LiveSearchFinished {
+                request_id: 2,
+                result: Ok(vec![moved.clone(), first]),
+            },
+        );
+        assert_eq!(app.selected_index, Some(0));
+        assert_eq!(app.selected_result(), Some(&moved));
+        assert_eq!(app.query, "current query");
     }
 
     #[test]
